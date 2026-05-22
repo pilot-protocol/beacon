@@ -20,7 +20,7 @@ import (
 	cw "github.com/coder/websocket"
 
 	"github.com/pilot-protocol/beacon/wss"
-	dwss "github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport/wss"
+	dwss "github.com/pilot-protocol/beacon/wss/internal/daemonwss"
 	"github.com/pilot-protocol/common/crypto"
 )
 
