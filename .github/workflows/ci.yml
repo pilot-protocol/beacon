@@ -34,6 +34,14 @@ jobs:
         working-directory: beacon
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./beacon/coverage.out
+          flags: unittests
+          name: beacon
+          fail_ci_if_error: false
+
       - name: Coverage summary
         working-directory: beacon
         run: go tool cover -func=coverage.out | tail -20

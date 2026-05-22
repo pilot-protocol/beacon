@@ -1,5 +1,9 @@
 # beacon
 
+[![ci](https://github.com/pilot-protocol/beacon/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/beacon/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/beacon/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/beacon)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 The Pilot Protocol beacon. The NAT-traversal sidecar that runs alongside the rendezvous server at the network edge:
 
 - **STUN** — daemons hit it to learn their public `host:port`.
@@ -36,3 +40,7 @@ go build ./cmd/beacon
 ```
 
 The build is hermetic Go with no cgo; any Go toolchain at the version pinned in `go.mod` will reproduce the binary.
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
