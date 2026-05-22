@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/net/ipv4"
 
-	bwss "github.com/TeoSlayer/pilotprotocol/pkg/beacon/wss"
+	bwss "github.com/pilot-protocol/beacon/wss"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 

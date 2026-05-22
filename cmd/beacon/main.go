@@ -11,7 +11,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/beacon"
+	"github.com/pilot-protocol/beacon"
 	"github.com/TeoSlayer/pilotprotocol/pkg/config"
 	"github.com/TeoSlayer/pilotprotocol/pkg/logging"
 )
