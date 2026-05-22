@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: beacon
+
+      - name: Checkout web4
+        uses: actions/checkout@v4
+        with:
+          repository: TeoSlayer/pilotprotocol
+          path: web4
+
+      - name: Checkout common
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/common
+          ref: v0.1.0
+          path: common
+
+      - name: Checkout app-store
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/app-store
+          ref: v0.1.0
+          path: app-store
+
+      - name: Checkout trustedagents
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/trustedagents
+          ref: v0.1.0
+          path: trustedagents
+
+      - name: Checkout skillinject
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/skillinject
+          ref: v0.1.0
+          path: skillinject
+
+      - name: Checkout webhook
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/webhook
+          ref: v0.1.0
+          path: webhook
+
+      - name: Checkout eventstream
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/eventstream
+          ref: v0.1.0
+          path: eventstream
+
+      - name: Checkout dataexchange
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/dataexchange
+          ref: v0.1.0
+          path: dataexchange
+
+      - name: Checkout updater
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/updater
+          ref: v0.1.0
+          path: updater
+
+      - name: Checkout gateway
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/gateway
+          ref: v0.1.0
+          path: gateway
+
+      - name: Checkout nameserver
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/nameserver
+          ref: v0.1.0
+          path: nameserver
+
+      - name: Checkout policy
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/policy
+          ref: v0.1.0
+          path: policy
+
+      - name: Checkout handshake
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/handshake
+          ref: v0.1.0
+          path: handshake
+
+      - name: Checkout runtime
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/runtime
+          ref: v0.1.0
+          path: runtime
+
+      - name: Checkout rendezvous
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/rendezvous
+          ref: v0.1.0
+          path: rendezvous
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: beacon/go.sum
+
+      - name: Run tests with coverage
+        working-directory: beacon
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        working-directory: beacon
+        run: go tool cover -func=coverage.out | tail -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-beacon
+          path: beacon/coverage.out
+          retention-days: 30
