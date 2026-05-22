@@ -28,11 +28,10 @@
 //   - No reconnect during graceful shutdown. Close() is final; the
 //     read goroutine exits cleanly and the next Recv returns ErrClosed.
 //
-// VENDORED from github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport/wss
-// for use in beacon's wss server tests. Until the protocol repo publishes
-// the post-extraction state on main, the daemon-side wss isn't reachable
-// as an import. This is a test fixture (internal/, not public API) and
-// is kept in sync with the upstream via copy.
+// This package is the daemon-side wss client used by the beacon's wss
+// server tests. It is internal/ (not public API) and exists so the beacon
+// has an in-process WebSocket-secure client to drive its own wss server
+// in unit and integration tests.
 package daemonwss
 
 import (
@@ -55,7 +54,7 @@ import (
 )
 
 // ErrClosed is the sentinel returned by Recv after the transport has
-// been Close()d. Mirrors web4 pkg/daemon/transport.ErrClosed.
+// been Close()d.
 var ErrClosed = errors.New("transport: closed")
 
 // DefaultIdlePingInterval is how often the daemon pings the beacon to
