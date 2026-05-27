@@ -154,8 +154,10 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	// Wait briefly for the http.Server goroutine to actually be ready
 	// to accept upgrades. The bridge's Start binds the listener but
 	// the http.Server.Serve goroutine may not yet have entered Accept.
-	if !waitUntil(2*time.Second, func() bool {
-		_, err := net.DialTimeout("tcp", wsAddr, 200*time.Millisecond)
+	// 10s outer budget — public CI runners under -race can take >2s
+	// before the goroutine reaches Accept.
+	if !waitUntil(10*time.Second, func() bool {
+		_, err := net.DialTimeout("tcp", wsAddr, 500*time.Millisecond)
 		return err == nil
 	}) {
 		t.Fatal("WSS bridge never accepted a TCP dial")
