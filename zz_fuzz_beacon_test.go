@@ -36,7 +36,7 @@ func sendUDP(t *testing.T, addr *net.UDPAddr, data []byte) []byte {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	if _, err := conn.Write(data); err != nil {
 		t.Fatalf("write: %v", err)
@@ -48,6 +48,21 @@ func sendUDP(t *testing.T, addr *net.UDPAddr, data []byte) []byte {
 		return nil // timeout = no reply
 	}
 	return buf[:n]
+}
+
+// waitUntil polls fn() every 10ms until it returns true or the timeout
+// expires. Returns true if the condition was met. Used in place of
+// fixed-duration sleeps so that CI runners under `-race` aren't pinned
+// to assumptions about how fast the receive goroutine drains a UDP send.
+func waitUntil(timeout time.Duration, fn func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fn()
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +231,7 @@ func TestBeaconSyncValidPeerList(t *testing.T) {
 
 	sendUDP(t, addr, msg)
 
-	// Check that peer nodes were registered
-	if s.PeerNodeCount() != 3 {
+	if !waitUntil(2*time.Second, func() bool { return s.PeerNodeCount() == 3 }) {
 		t.Fatalf("expected 3 peer nodes, got %d", s.PeerNodeCount())
 	}
 }
@@ -392,9 +406,7 @@ func TestBeaconPeerNodeCount(t *testing.T) {
 	binary.BigEndian.PutUint32(msg[11:], 200)
 	sendUDP(t, addr, msg)
 
-	time.Sleep(50 * time.Millisecond)
-
-	if s.PeerNodeCount() != 2 {
+	if !waitUntil(2*time.Second, func() bool { return s.PeerNodeCount() == 2 }) {
 		t.Fatalf("expected 2 peer nodes, got %d", s.PeerNodeCount())
 	}
 }

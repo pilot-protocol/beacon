@@ -51,6 +51,20 @@ func beaconUDPAddr(t *testing.T, s *Server) *net.UDPAddr {
 	return addr
 }
 
+// waitUntil polls fn() every 10ms until it returns true or the timeout
+// expires. Used in place of fixed sleeps so CI runners under `-race`
+// aren't pinned to receive-goroutine-drain assumptions.
+func waitUntil(timeout time.Duration, fn func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fn()
+}
+
 func TestGossip(t *testing.T) {
 	t.Parallel()
 
@@ -92,14 +106,9 @@ func TestGossip(t *testing.T) {
 	b1.sendGossip()
 	b2.sendGossip()
 
-	// Give gossip time to propagate
-	time.Sleep(200 * time.Millisecond)
-
 	// Each beacon should know about the other's node via gossip
-	if b1.PeerNodeCount() != 1 {
+	if !waitUntil(2*time.Second, func() bool { return b1.PeerNodeCount() == 1 && b2.PeerNodeCount() == 1 }) {
 		t.Errorf("b1 peer nodes: got %d, want 1", b1.PeerNodeCount())
-	}
-	if b2.PeerNodeCount() != 1 {
 		t.Errorf("b2 peer nodes: got %d, want 1", b2.PeerNodeCount())
 	}
 }
@@ -255,9 +264,7 @@ func TestSyncMessageParsing(t *testing.T) {
 		t.Fatalf("send sync: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if s.PeerNodeCount() != 3 {
+	if !waitUntil(2*time.Second, func() bool { return s.PeerNodeCount() == 3 }) {
 		t.Fatalf("peer nodes: got %d, want 3", s.PeerNodeCount())
 	}
 }
