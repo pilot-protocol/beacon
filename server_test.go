@@ -140,10 +140,15 @@ func TestCrossBeaconRelay(t *testing.T) {
 	conn2 := registerNode(t, b2Addr, 20)
 	defer conn2.Close()
 
-	// Gossip so b1 knows node 20 is on b2
+	// Gossip so b1 knows node 20 is on b2 — poll instead of fixed
+	// sleep so this isn't tight under CI load.
 	b1.sendGossip()
 	b2.sendGossip()
-	time.Sleep(200 * time.Millisecond)
+	if !waitUntil(5*time.Second, func() bool {
+		return b1.PeerNodeCount() >= 1 && b2.PeerNodeCount() >= 1
+	}) {
+		t.Fatal("gossip did not propagate before relay send")
+	}
 
 	// Node 10 sends relay to node 20 via beacon 1
 	// beacon 1 should forward to beacon 2, which delivers to node 20
@@ -158,9 +163,10 @@ func TestCrossBeaconRelay(t *testing.T) {
 		t.Fatalf("send relay: %v", err)
 	}
 
-	// Node 20 should receive a RelayDeliver
+	// Node 20 should receive a RelayDeliver. 10s deadline gives CI
+	// runners under -race comfortable margin; happy path still ~10ms.
 	buf := make([]byte, 1500)
-	conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn2.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn2.Read(buf)
 	if err != nil {
 		t.Fatalf("read relay deliver: %v", err)
