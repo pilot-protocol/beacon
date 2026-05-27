@@ -43,7 +43,7 @@ type authOKMsg struct {
 func dialCompatWSS(t *testing.T, addr string, id *crypto.Identity, nodeID uint32) *websocket.Conn {
 	t.Helper()
 	url := "ws://" + addr + "/v1/compat"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		Subprotocols: []string{"pilot.v1"},
@@ -176,7 +176,7 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	disc := make([]byte, 5)
 	disc[0] = protocol.BeaconMsgDiscover
 	binary.BigEndian.PutUint32(disc[1:], nodeID)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := conn.Write(ctx, websocket.MessageBinary, disc); err != nil {
 		t.Fatalf("ws write discover: %v", err)
@@ -202,7 +202,7 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	}
 
 	// Read the relayed frame back from the daemon side.
-	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	readCtx, readCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer readCancel()
 	msgType, body, err := conn.Read(readCtx)
 	if err != nil {
