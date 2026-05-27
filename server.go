@@ -441,6 +441,13 @@ func (s *Server) RelayDropped() uint64 { return s.relayDropped.Load() }
 func (s *Server) RelayNotFound() uint64 { return s.relayNotFound.Load() }
 
 func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
+	// Empty-frame guard. The UDP readLoop screens len(data)<1, but the
+	// WSS OnFrame path only enforces an upper bound — a 0-byte binary
+	// frame from any authenticated WSS peer used to crash the beacon
+	// here on data[0].
+	if len(data) == 0 {
+		return
+	}
 	msgType := data[0]
 
 	switch msgType {
@@ -504,19 +511,18 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 	// Update requester's endpoint (handles symmetric NAT port changes).
 	s.nodes.Upsert(requesterID, remote, time.Now(), maxBeaconNodes)
 
-	targetNode := s.nodes.Get(targetID)
-	requesterNode := s.nodes.Get(requesterID)
-	if targetNode == nil {
+	// Snapshot reads addr under RLock — Get() returns a pointer whose
+	// fields race with concurrent Upsert (see nodes_shard.go caveat).
+	targetAddr, targetOK := s.nodes.Snapshot(targetID)
+	requesterAddr, requesterOK := s.nodes.Snapshot(requesterID)
+	if !targetOK {
 		slog.Warn("punch target not found", "target_id", targetID)
 		return
 	}
-	if requesterNode == nil {
+	if !requesterOK {
 		slog.Warn("punch requester not found", "requester_id", requesterID)
 		return
 	}
-
-	targetAddr := targetNode.addr
-	requesterAddr := requesterNode.addr
 
 	// Send punch commands to both sides
 	if err := s.SendPunchCommand(requesterID, targetAddr.IP, uint16(targetAddr.Port)); err != nil {
@@ -815,11 +821,13 @@ func (s *Server) relayStatsLoop() {
 
 // SendPunchCommand tells a node to send UDP to a target endpoint.
 func (s *Server) SendPunchCommand(nodeID uint32, targetIP net.IP, targetPort uint16) error {
-	node := s.nodes.Get(nodeID)
-	if node == nil {
+	// Snapshot returns the address under RLock so we don't race with
+	// a concurrent Upsert mutating beaconNode.addr — see
+	// nodes_shard.go Get() caveat (race detector flag, 2026-05-19).
+	nodeAddr, ok := s.nodes.Snapshot(nodeID)
+	if !ok {
 		return fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
 	}
-	nodeAddr := node.addr
 
 	ip := targetIP.To4()
 	if ip == nil {
