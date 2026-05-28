@@ -82,23 +82,25 @@ func dialWith(ctx context.Context, url string, id *crypto.Identity, nodeID uint3
 }
 
 // sendChallenge writes the standard auth_challenge envelope and returns
-// the nonce it sent (so handlers can verify the daemon's signature, or
-// not).
-func sendChallenge(t *testing.T, ctx context.Context, conn *websocket.Conn) string {
+// the nonce and timestamp it sent (so handlers can verify the daemon's
+// signature, or not).
+func sendChallenge(t *testing.T, ctx context.Context, conn *websocket.Conn) (string, int64) {
 	t.Helper()
 	nonceBytes := make([]byte, 32)
 	for i := range nonceBytes {
 		nonceBytes[i] = byte(i)
 	}
 	nonce := hex.EncodeToString(nonceBytes)
-	body, _ := json.Marshal(map[string]string{
+	ts := time.Now().Unix()
+	body, _ := json.Marshal(map[string]any{
 		"type":  "auth_challenge",
 		"nonce": nonce,
+		"ts":    ts,
 	})
 	if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
 		t.Logf("sendChallenge write: %v", err)
 	}
-	return nonce
+	return nonce, ts
 }
 
 // fullAuth runs the canonical happy-path server handshake. Used by
@@ -116,7 +118,7 @@ func fullAuth(t *testing.T, w http.ResponseWriter, r *http.Request) *websocket.C
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
-	nonce := sendChallenge(t, ctx, conn)
+	nonce, _ := sendChallenge(t, ctx, conn)
 
 	_, body, err := conn.Read(ctx)
 	if err != nil {
@@ -378,7 +380,7 @@ func TestDial_ChallengeReadyNonceVerifies(t *testing.T) {
 		defer conn.Close(websocket.StatusNormalClosure, "")
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		nonce := sendChallenge(t, ctx, conn)
+		nonce, ts := sendChallenge(t, ctx, conn)
 		_, body, err := conn.Read(ctx)
 		if err != nil {
 			return
@@ -396,7 +398,7 @@ func TestDial_ChallengeReadyNonceVerifies(t *testing.T) {
 		if err != nil {
 			return
 		}
-		signed := []byte(fmt.Sprintf("compat_auth:%d:%s", reply.NodeID, nonce))
+		signed := []byte(fmt.Sprintf("compat_auth:%d:%d:%s", reply.NodeID, ts, nonce))
 		if reply.NodeID != nodeID {
 			return
 		}
