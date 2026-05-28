@@ -274,3 +274,32 @@ func TestSyncMessageParsing(t *testing.T) {
 		t.Fatalf("peer nodes: got %d, want 3", s.PeerNodeCount())
 	}
 }
+
+// TestServer_CloseIsIdempotent regression-guards the fix that wraps
+// Server.Close() in sync.Once. Prior to the fix the second Close()
+// re-invoked Close() on every already-closed *net.UDPConn in s.conns,
+// surfacing "use of closed network connection" as firstErr.
+func TestServer_CloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	go s.ListenAndServe("127.0.0.1:0")
+	<-s.Ready()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: unexpected error: %v", err)
+	}
+
+	// The bug: pre-fix this second call walked s.conns and re-closed
+	// each *net.UDPConn, returning "use of closed network connection".
+	// With sync.Once + cached closeErr it must be a no-op.
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: expected no-op, got: %v", err)
+	}
+
+	// A third call for good measure — sync.Once guarantees the
+	// teardown body runs exactly once regardless of call count.
+	if err := s.Close(); err != nil {
+		t.Fatalf("third Close: expected no-op, got: %v", err)
+	}
+}
