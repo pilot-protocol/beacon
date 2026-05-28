@@ -330,6 +330,13 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	s.upgradeOK.Add(1)
 
+	// Set a per-connection read limit so the websocket library
+	// rejects oversized frames BEFORE allocating read buffers.
+	// Without this, the library allocates the full frame and we
+	// only check len(body) after the fact (the check at line 440
+	// is now a belt-and-suspenders fallback).
+	conn.SetReadLimit(MaxFrameSize)
+
 	authCtx, cancel := context.WithTimeout(r.Context(), s.cfg.AuthTimeout)
 	defer cancel()
 
