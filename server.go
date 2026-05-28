@@ -71,6 +71,12 @@ type Server struct {
 	wssServer *bwss.Server
 
 	done chan struct{} // closed on shutdown
+
+	// Close idempotency. The actual teardown runs at most once
+	// inside closeOnce.Do(); subsequent Close() calls are no-ops
+	// and re-return the first-error from the original teardown.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // relayQueueSize is the buffered channel depth between the read loop
@@ -413,19 +419,26 @@ func (s *Server) Addr() net.Addr {
 	return s.conn.LocalAddr()
 }
 
+// Close shuts down the server's UDP sockets and signals goroutines to exit.
+// Safe to call multiple times: the teardown runs exactly once, and any
+// subsequent call returns the first-error observed during that single
+// teardown without re-closing already-closed sockets.
 func (s *Server) Close() error {
-	select {
-	case <-s.done:
-	default:
-		close(s.done)
-	}
-	var firstErr error
-	for _, c := range s.conns {
-		if err := c.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	s.closeOnce.Do(func() {
+		select {
+		case <-s.done:
+		default:
+			close(s.done)
 		}
-	}
-	return firstErr
+		var firstErr error
+		for _, c := range s.conns {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		s.closeErr = firstErr
+	})
+	return s.closeErr
 }
 
 // RelayForwarded returns the count of relay packets the beacon
