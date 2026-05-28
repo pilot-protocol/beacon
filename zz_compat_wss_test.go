@@ -156,8 +156,12 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	// the http.Server.Serve goroutine may not yet have entered Accept.
 	// 10s outer budget — public CI runners under -race can take >2s
 	// before the goroutine reaches Accept.
-	if !waitUntil(10*time.Second, func() bool {
-		_, err := net.DialTimeout("tcp", wsAddr, 500*time.Millisecond)
+	// 30s outer budget — under -race + the expanded daemonwss test set,
+	// CI runners have been observed taking 13+ seconds before the
+	// http.Server.Serve goroutine reaches Accept. 30s gives margin
+	// without making the happy path slow (still ~10ms in practice).
+	if !waitUntil(30*time.Second, func() bool {
+		_, err := net.DialTimeout("tcp", wsAddr, 1*time.Second)
 		return err == nil
 	}) {
 		t.Fatal("WSS bridge never accepted a TCP dial")
