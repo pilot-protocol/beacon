@@ -3,6 +3,7 @@
 package wss_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -444,6 +445,68 @@ func TestServer_CloseIdempotent(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Errorf("second Close: %v (must be nil)", err)
+	}
+}
+
+// TestServer_NoStaleFramesOnReplacement verifies that when a new WSS
+// connection for the same nodeID replaces an existing peer, frame
+// dispatch continues correctly through the replacement and no stale
+// frames leak. The generation counter in handleUpgrade / peerReadLoop
+// ensures in-flight frames from the replaced peer are dropped.
+//
+// NOTE: daemonwss Transport auto-reconnects on disconnect, so keeping
+// both transports alive simultaneously creates a reconnect storm.
+// We close tr1 first (same pattern as TestServer_LastWriterWinsOnReconnect)
+// and then verify tr2 delivers frames — the generation gate is defense-
+// in-depth for the narrow window between old conn close and new peer
+// install.
+func TestServer_NoStaleFramesOnReplacement(t *testing.T) {
+	t.Parallel()
+	id, _ := crypto.GenerateIdentity()
+	nodeID := uint32(77)
+
+	s, wsURL, frames, teardown := withStartedServer(t, map[uint32]ed25519.PublicKey{
+		nodeID: ed25519.PublicKey(id.PublicKey),
+	})
+	defer teardown()
+
+	// Connect first peer.
+	tr1 := mustDialDaemon(t, wsURL, id, nodeID)
+	waitForCondition(500*time.Millisecond, func() bool { return s.IsConnected(nodeID) })
+
+	// Close tr1 so its supervisor doesn't reconnect-storm with tr2.
+	_ = tr1.Close()
+
+	// Connect second peer — handleUpgrade replaces tr1's peer in s.peers.
+	tr2 := mustDialDaemon(t, wsURL, id, nodeID)
+	defer tr2.Close()
+
+	waitForCondition(500*time.Millisecond, func() bool { return s.IsConnected(nodeID) })
+
+	// Send a frame from tr2 — it must arrive intact after replacement.
+	marker := []byte("tr2-after-replace")
+	if _, err := tr2.Send(marker, nil); err != nil {
+		t.Fatalf("tr2.Send after replacement: %v", err)
+	}
+
+	select {
+	case f := <-frames:
+		if !bytes.Equal(f.frame, marker) {
+			t.Errorf("expected %q, got %q", marker, f.frame)
+		}
+		if f.senderID != nodeID {
+			t.Errorf("expected senderID %d, got %d", nodeID, f.senderID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for tr2 frame")
+	}
+
+	// Drain: verify no stale frame from tr1 leaked through.
+	select {
+	case f := <-frames:
+		t.Errorf("unexpected stale frame from sender %d: %q", f.senderID, f.frame)
+	case <-time.After(500 * time.Millisecond):
+		// OK — no stale frame.
 	}
 }
 

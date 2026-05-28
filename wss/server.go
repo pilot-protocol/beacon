@@ -111,6 +111,11 @@ type Server struct {
 	listener net.Listener // captured at Start, so Addr() reports the real bound port even when BindAddr=":0"
 	wg       sync.WaitGroup
 
+	// peerGen is a monotonic generation counter bumped on each
+	// handleUpgrade replacement. wssPeer.gen is stamped from this
+	// counter; peerReadLoop drops frames if its gen is stale.
+	peerGen atomic.Uint32
+
 	// Metrics
 	upgradeOK    atomic.Uint64
 	upgradeFail  atomic.Uint64
@@ -127,6 +132,7 @@ type wssPeer struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	closed  atomic.Bool
+	gen     atomic.Uint32 // generation stamp; frames from stale peers are dropped
 }
 
 // authChallengeMsg / authReplyMsg / authOKMsg mirror the daemon-side
@@ -355,12 +361,14 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		conn.Close(websocket.StatusGoingAway, "server shutting down")
 		return
 	}
-	// Replace any prior peer for this nodeID (last-writer-wins; the
-	// old connection's read goroutine will exit on next read error).
+	// Replace any prior peer for this nodeID. Bump the generation
+	// counter so the old peerReadLoop drops in-flight frames rather
+	// than dispatching them after the new peer is installed.
 	if old := s.peers[nodeID]; old != nil {
 		old.closed.Store(true)
 		_ = old.conn.Close(websocket.StatusNormalClosure, "replaced")
 	}
+	p.gen.Store(s.peerGen.Add(1))
 	s.peers[nodeID] = p
 	s.mu.Unlock()
 
@@ -450,9 +458,28 @@ func (s *Server) peerReadLoop(p *wssPeer) {
 			slog.Warn("wss peer sent oversized frame", "node_id", p.nodeID, "len", len(body))
 			return
 		}
+		// Drop frames dispatched by a replaced peer. The generation
+		// counter is bumped on each handleUpgrade replacement; if
+		// our stamp is lower than the currently installed peer's,
+		// we are stale.
+		if g := s.peerGenForNode(p.nodeID); g > 0 && p.gen.Load() < g {
+			continue
+		}
 		s.framesIn.Add(1)
 		s.cfg.OnFrame(p.nodeID, body)
 	}
+}
+
+// peerGenForNode returns the generation stamp of the currently
+// installed peer for nodeID, or 0 if no peer is installed.
+func (s *Server) peerGenForNode(nodeID uint32) uint32 {
+	s.mu.RLock()
+	p := s.peers[nodeID]
+	s.mu.RUnlock()
+	if p == nil {
+		return 0
+	}
+	return p.gen.Load()
 }
 
 // dropPeer removes a peer from the map and closes the underlying WS
