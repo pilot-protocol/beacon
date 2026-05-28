@@ -18,7 +18,7 @@ import (
 	"golang.org/x/net/ipv4"
 
 	bwss "github.com/pilot-protocol/beacon/wss"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // beaconNode tracks a node's observed endpoint and when it was last seen.
