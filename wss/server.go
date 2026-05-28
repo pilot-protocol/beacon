@@ -249,7 +249,9 @@ func (s *Server) WriteFrame(destID uint32, frame []byte) bool {
 		return false
 	}
 	p.writeMu.Lock()
-	err := p.conn.Write(context.Background(), websocket.MessageBinary, frame)
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.IdleTimeout)
+	defer cancel()
+	err := p.conn.Write(ctx, websocket.MessageBinary, frame)
 	p.writeMu.Unlock()
 	if err != nil {
 		s.dropPeer(destID, "write error: "+err.Error())
