@@ -479,6 +479,46 @@ func waitForCondition(timeout time.Duration, cond func() bool) bool {
 	return cond()
 }
 
+// TestServer_RejectsOversizedFrame verifies that the server's
+// per-connection SetReadLimit(MaxFrameSize) rejects frames larger
+// than 64 KB before allocating read buffers. The oversized frame
+// causes the peer to be dropped by the read loop.
+func TestServer_RejectsOversizedFrame(t *testing.T) {
+	t.Parallel()
+	id, _ := crypto.GenerateIdentity()
+	nodeID := uint32(5555)
+
+	s, wsURL, _, teardown := withStartedServer(t, map[uint32]ed25519.PublicKey{
+		nodeID: ed25519.PublicKey(id.PublicKey),
+	})
+	defer teardown()
+
+	tr := mustDialDaemon(t, wsURL, id, nodeID)
+	defer tr.Close()
+
+	// Wait for peer to register.
+	if !waitForCondition(500*time.Millisecond, func() bool { return s.IsConnected(nodeID) }) {
+		t.Fatal("peer never appeared as connected on server")
+	}
+
+	// Send a frame larger than MaxFrameSize (64 KB).
+	oversized := make([]byte, 128*1024) // 128 KB
+	for i := range oversized {
+		oversized[i] = byte(i % 256)
+	}
+
+	// The daemon-side Send may succeed (write buffers),
+	// but the server read loop will encounter ErrMessageTooBig
+	// from SetReadLimit and drop the peer.
+	tr.Send(oversized, nil)
+
+	// Give the server read loop time to process the error.
+	// After the oversized frame, the peer should be dropped.
+	if !waitForCondition(500*time.Millisecond, func() bool { return !s.IsConnected(nodeID) }) {
+		t.Error("peer still connected after oversized frame; expected disconnection")
+	}
+}
+
 // Sanity: keep imports used. Some of these are pulled in by sub-tests
 // only; the unused-import linter is happier with the references.
 var (
