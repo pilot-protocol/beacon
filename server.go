@@ -52,6 +52,11 @@ type Server struct {
 	lastDropLog     atomic.Int64  // UnixNano of last drop warning (rate limit)
 	lastNotFoundLog atomic.Int64  // UnixNano of last not-found warning (rate limit)
 
+	// Punch-request rate limiters (SEC-026).
+	punchRateMu     sync.Mutex           // protects punchSourceLast
+	punchSourceLast map[string]time.Time // source IP → last allowed punch time
+	lastPunchTime   atomic.Int64         // UnixNano of last global punch (rate limit)
+
 	// Peer mesh (gossip)
 	beaconID    uint32
 	peers       []*net.UDPAddr                          // peer beacon addresses (slow path, peerMu)
@@ -103,6 +108,16 @@ const maxBeaconNodes = 500_000
 // so nodes survive brief registry outages without losing beacon registration.
 const beaconNodeTTL = 10 * time.Minute
 
+// Punch-request rate limits (SEC-026). Without these, handlePunchRequest
+// is an open UDP amplification + port-scanning oracle: any source can
+// trigger the beacon to send packets to arbitrary targets, and timing
+// side-channels leak node registration status.
+const (
+	maxPunchPerSecond       = 10              // global hard cap on punch commands per second
+	punchPerSourceInterval  = time.Second     // min interval between punches from same source
+	punchRateCleanupInterval = 5 * time.Minute // how often stale source entries are swept
+)
+
 func New() *Server {
 	return NewWithPeers(0, nil)
 }
@@ -117,6 +132,7 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 		relayCh:  make(chan relayJob, relayQueueSize),
 		beaconID: beaconID,
 		done:     make(chan struct{}),
+		punchSourceLast: make(map[string]time.Time),
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
@@ -518,6 +534,23 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 		return
 	}
 
+	// --- Rate-limit guard (SEC-026) ---
+	// 1. Global cap: maxPunchPerSecond punch commands per second total.
+	now := time.Now().UnixNano()
+	if last := s.lastPunchTime.Load(); now-last < int64(time.Second)/maxPunchPerSecond {
+		return
+	}
+	// 2. Per-source cap: at most one punch per punchPerSourceInterval.
+	sourceKey := remote.IP.String()
+	s.punchRateMu.Lock()
+	if last, ok := s.punchSourceLast[sourceKey]; ok && time.Since(last) < punchPerSourceInterval {
+		s.punchRateMu.Unlock()
+		return
+	}
+	s.punchSourceLast[sourceKey] = time.Now()
+	s.lastPunchTime.Store(now)
+	s.punchRateMu.Unlock()
+
 	requesterID := binary.BigEndian.Uint32(data[0:4])
 	targetID := binary.BigEndian.Uint32(data[4:8])
 
@@ -883,6 +916,16 @@ func (s *Server) reapLoop() {
 func (s *Server) reapStaleNodes() {
 	threshold := time.Now().Add(-beaconNodeTTL)
 	s.nodes.ReapStale(threshold)
+
+	// Sweep stale punch-rate entries to prevent unbounded map growth.
+	s.punchRateMu.Lock()
+	cutoff := time.Now().Add(-punchRateCleanupInterval)
+	for ip, last := range s.punchSourceLast {
+		if last.Before(cutoff) {
+			delete(s.punchSourceLast, ip)
+		}
+	}
+	s.punchRateMu.Unlock()
 }
 
 // --- Gossip ---
