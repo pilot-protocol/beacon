@@ -23,8 +23,9 @@ import (
 // types in the wss server — we duplicate them here so this test can
 // drive the WSS bridge without importing the internal daemon client.
 type authChallengeMsg struct {
-	Type  string `json:"type"`
-	Nonce string `json:"nonce"`
+	Type      string `json:"type"`
+	Nonce     string `json:"nonce"`
+	Timestamp int64  `json:"ts"`
 }
 
 type authReplyMsg struct {
@@ -69,7 +70,7 @@ func dialCompatWSS(t *testing.T, addr string, id *crypto.Identity, nodeID uint32
 	}
 
 	// 2. Sign and reply.
-	signed := []byte(fmt.Sprintf("compat_auth:%d:%s", nodeID, ch.Nonce))
+	signed := []byte(fmt.Sprintf("compat_auth:%d:%d:%s", nodeID, ch.Timestamp, ch.Nonce))
 	sig := id.Sign(signed)
 	reply := authReplyMsg{
 		Type:      "auth_reply",
