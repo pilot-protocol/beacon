@@ -25,11 +25,14 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write
+
 jobs:
   bump:
     uses: pilot-protocol/release/.github/workflows/tag-bump.yml@main
     with:
-      upstream: ${{ github.event.client_payload.upstream || inputs.upstream }}
-      version:  ${{ github.event.client_payload.version  || inputs.version }}
-      is_prerelease: ${{ fromJSON(github.event.client_payload.is_prerelease || inputs.is_prerelease || 'false') }}
+      upstream: ${{ inputs.upstream || github.event.client_payload.upstream }}
+      version: ${{ inputs.version || github.event.client_payload.version }}
+      is_prerelease: ${{ inputs.is_prerelease == true || github.event.client_payload.is_prerelease == true }}
       stable_only: true
