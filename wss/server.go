@@ -138,9 +138,15 @@ type wssPeer struct {
 // authChallengeMsg / authReplyMsg / authOKMsg mirror the daemon-side
 // shapes in pkg/daemon/transport/wss. Kept in sync via SPEC.
 type authChallengeMsg struct {
-	Type  string `json:"type"`
-	Nonce string `json:"nonce"`
+	Type      string `json:"type"`
+	Nonce     string `json:"nonce"`
+	Timestamp int64  `json:"ts"`
 }
+
+// maxAuthAge is the maximum age (in seconds) a client may sign after
+// the server issues the challenge. Beyond this window the server
+// rejects the reply as a potential replay.
+const maxAuthAge = 30
 
 type authReplyMsg struct {
 	Type      string `json:"type"`
@@ -386,7 +392,8 @@ func (s *Server) runAuth(ctx context.Context, conn *websocket.Conn) (uint32, err
 	}
 	nonce := hex.EncodeToString(nonceBytes)
 
-	challenge := authChallengeMsg{Type: "auth_challenge", Nonce: nonce}
+	ts := time.Now().Unix()
+	challenge := authChallengeMsg{Type: "auth_challenge", Nonce: nonce, Timestamp: ts}
 	chBytes, _ := json.Marshal(challenge)
 	if err := conn.Write(ctx, websocket.MessageText, chBytes); err != nil {
 		return 0, fmt.Errorf("write challenge: %w", err)
@@ -415,7 +422,14 @@ func (s *Server) runAuth(ctx context.Context, conn *websocket.Conn) (uint32, err
 	if err != nil {
 		return 0, fmt.Errorf("bad sig encoding: %w", err)
 	}
-	signed := fmt.Sprintf("compat_auth:%d:%s", reply.NodeID, nonce)
+	// Check timestamp freshness before verifying the expensive
+	// Ed25519 signature.  Allow up to maxAuthAge seconds of skew;
+	// beyond that treat it as a replay attempt.
+	if age := time.Now().Unix() - ts; age < 0 || age > maxAuthAge {
+		return 0, fmt.Errorf("auth timestamp expired or in future: age=%ds (max %ds)", age, maxAuthAge)
+	}
+
+	signed := fmt.Sprintf("compat_auth:%d:%d:%s", reply.NodeID, ts, nonce)
 	if !ed25519.Verify(pubKey, []byte(signed), sig) {
 		return 0, fmt.Errorf("ed25519 verify failed for node_id %d", reply.NodeID)
 	}
