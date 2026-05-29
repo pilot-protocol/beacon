@@ -1,0 +1,35 @@
+name: cascade
+
+# Beacon is a Zone-1 sibling. Cascades from upstream releases arrive
+# as repository_dispatch events; we delegate the whole bump-build-
+# tag-push dance to pilot-protocol/release's reusable tag-bump
+# workflow. Two-trigger setup so we can also manually exercise the
+# cascade from the Actions tab.
+
+on:
+  repository_dispatch:
+    types: [bump-upstream]
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: 'Upstream Go module (e.g. github.com/pilot-protocol/common)'
+        required: true
+        type: string
+      version:
+        description: 'Upstream version (e.g. v0.4.0 or v0.5.0-beta.1)'
+        required: true
+        type: string
+      is_prerelease:
+        description: 'true if upstream is a beta/rc'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  bump:
+    uses: pilot-protocol/release/.github/workflows/tag-bump.yml@main
+    with:
+      upstream: ${{ github.event.client_payload.upstream || inputs.upstream }}
+      version:  ${{ github.event.client_payload.version  || inputs.version }}
+      is_prerelease: ${{ fromJSON(github.event.client_payload.is_prerelease || inputs.is_prerelease || 'false') }}
+      stable_only: true
