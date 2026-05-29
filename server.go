@@ -537,9 +537,24 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 		return
 	}
 
-	// Send punch commands to both sides
+	// Narrow the TOCTOU window before each send: re-snapshot the target
+	// address immediately before telling the requester to punch at it.
+	// Between the initial snapshot above and now, the target may have
+	// re-registered from a different NAT binding. The window is still
+	// non-zero (no locking across the UDP write) — UDP best-effort
+	// absorbs the remaining loss; the daemon retries on timeout.
+	if addr, ok := s.nodes.Snapshot(targetID); ok {
+		targetAddr = addr
+	}
 	if err := s.SendPunchCommand(requesterID, targetAddr.IP, uint16(targetAddr.Port)); err != nil {
 		slog.Debug("punch command to requester failed", "node_id", requesterID, "err", err)
+	}
+
+	// Same re-snapshot for the requester address before telling the
+	// target to punch back. The requester's endpoint was upserted at
+	// the top of this function but may have flipped by now.
+	if addr, ok := s.nodes.Snapshot(requesterID); ok {
+		requesterAddr = addr
 	}
 	if err := s.SendPunchCommand(targetID, requesterAddr.IP, uint16(requesterAddr.Port)); err != nil {
 		slog.Debug("punch command to target failed", "node_id", targetID, "err", err)
