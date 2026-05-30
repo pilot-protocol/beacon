@@ -334,7 +334,8 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols: []string{"pilot.v1"},
+		Subprotocols:  []string{"pilot.v1"},
+		OriginPatterns: []string{"pilot://*"},
 	})
 	if err != nil {
 		s.upgradeFail.Add(1)
