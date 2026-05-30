@@ -218,18 +218,19 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Set unhealthy
+	// /healthz always returns 200 regardless of drain state
+	// (operational fingerprint — drain state should not be broadcast)
 	s.SetHealthy(false)
 	resp, err = http.Get(url)
 	if err != nil {
 		t.Fatalf("GET /healthz after unhealthy: %v", err)
 	}
-	if resp.StatusCode != 503 {
-		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 (no drain fingerprint), got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
-	// Set healthy again
+	// Return to healthy — still 200
 	s.SetHealthy(true)
 	resp, err = http.Get(url)
 	if err != nil {
