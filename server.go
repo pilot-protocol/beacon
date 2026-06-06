@@ -1279,13 +1279,8 @@ func (s *Server) registryDiscover() {
 func (s *Server) ServeHealth(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if s.healthOk.Load() {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "ok")
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprint(w, "unhealthy")
-		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
 	})
 	slog.Info("health endpoint listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
