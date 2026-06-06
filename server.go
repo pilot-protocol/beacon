@@ -61,6 +61,10 @@ type Server struct {
 	relayRateMu      sync.Mutex                     // protects relaySourceCount
 	relaySourceCount map[uint32]*relaySourceWindow   // senderID → sliding window state
 
+	// Per-nodeID discover rate limiter (PILOT-334) — prevents endpoint flapping.
+	discoverRateMu   sync.Mutex
+	discoverRateLast map[uint32]time.Time // nodeID → last allowed discover endpoint update
+
 	// Peer mesh (gossip)
 	beaconID    uint32
 	peers       []*net.UDPAddr                          // peer beacon addresses (slow path, peerMu)
@@ -120,6 +124,7 @@ const (
 	maxPunchPerSecond       = 10              // global hard cap on punch commands per second
 	punchPerSourceInterval  = time.Second     // min interval between punches from same source
 	punchRateCleanupInterval = 5 * time.Minute // how often stale source entries are swept
+	discoverMinInterval     = 30 * time.Second // min interval between endpoint updates from same nodeID
 )
 
 // relaySourceWindow tracks a single source's relay count in the current 1-second window.
@@ -153,6 +158,7 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 		done:     make(chan struct{}),
 		punchSourceLast:  make(map[string]time.Time),
 		relaySourceCount: make(map[uint32]*relaySourceWindow),
+		discoverRateLast: make(map[uint32]time.Time),
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
@@ -520,9 +526,20 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr) {
 
 	nodeID := binary.BigEndian.Uint32(data[0:4])
 
-	// Record this node's observed public endpoint. Sharded — no global lock.
-	if _, atCap := s.nodes.Upsert(nodeID, remote, time.Now(), maxBeaconNodes); atCap {
-		return // shard at capacity — drop silently
+	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
+	// nodeID from flapping its endpoint via rapid Discover messages.
+	s.discoverRateMu.Lock()
+	if last, ok := s.discoverRateLast[nodeID]; ok && time.Since(last) < discoverMinInterval {
+		s.discoverRateMu.Unlock()
+		// Rate-limited: skip the Upsert but still reply with the
+		// observed address so the node learns its public endpoint.
+	} else {
+		s.discoverRateLast[nodeID] = time.Now()
+		s.discoverRateMu.Unlock()
+		// Record this node's observed public endpoint. Sharded — no global lock.
+		if _, atCap := s.nodes.Upsert(nodeID, remote, time.Now(), maxBeaconNodes); atCap {
+			return // shard at capacity — drop silently
+		}
 	}
 
 	slog.Debug("beacon discover", "node_id", nodeID, "addr", remote)
@@ -994,6 +1011,16 @@ func (s *Server) reapStaleNodes() {
 		}
 	}
 	s.relayRateMu.Unlock()
+
+	// Sweep stale discover-rate entries (PILOT-334).
+	s.discoverRateMu.Lock()
+	discoverCutoff := time.Now().Add(-discoverMinInterval * 2)
+	for id, last := range s.discoverRateLast {
+		if last.Before(discoverCutoff) {
+			delete(s.discoverRateLast, id)
+		}
+	}
+	s.discoverRateMu.Unlock()
 }
 
 // --- Gossip ---
