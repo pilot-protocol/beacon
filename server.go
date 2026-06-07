@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,11 @@ type Server struct {
 	punchRateMu     sync.Mutex           // protects punchSourceLast
 	punchSourceLast map[string]time.Time // source IP → last allowed punch time
 	lastPunchTime   atomic.Int64         // UnixNano of last global punch (rate limit)
+	// PILOT-342: source-IP whitelist. Sources in this set bypass BOTH the
+	// per-source and the global punch-rate caps. Written once at startup
+	// via SetPunchWhitelist, read on every handlePunchRequest under
+	// atomic.Pointer so we don't need a hot-path lock.
+	punchWhitelist atomic.Pointer[map[string]struct{}]
 
 	// Per-source relay rate limiters (SEC-037).
 	relayRateMu      sync.Mutex                     // protects relaySourceCount
@@ -162,6 +168,10 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
+	// PILOT-342: empty whitelist by default — every source goes through
+	// the rate limit. SetPunchWhitelist may replace this from main.
+	emptyWL := make(map[string]struct{})
+	s.punchWhitelist.Store(&emptyWL)
 	s.pool.New = func() interface{} {
 		b := make([]byte, 1500)
 		return &b
@@ -571,22 +581,35 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 		return
 	}
 
+	sourceKey := remote.IP.String()
+	// PILOT-342: whitelisted sources bypass BOTH rate-limit gates. Used
+	// for trusted operator IPs (test rigs, paired beacons) where the
+	// SEC-026 amplification protection is overkill.
+	if wl := s.punchWhitelist.Load(); wl != nil {
+		if _, ok := (*wl)[sourceKey]; ok {
+			goto rateLimitBypass
+		}
+	}
+
 	// --- Rate-limit guard (SEC-026) ---
 	// 1. Global cap: maxPunchPerSecond punch commands per second total.
-	now := time.Now().UnixNano()
-	if last := s.lastPunchTime.Load(); now-last < int64(time.Second)/maxPunchPerSecond {
-		return
-	}
-	// 2. Per-source cap: at most one punch per punchPerSourceInterval.
-	sourceKey := remote.IP.String()
-	s.punchRateMu.Lock()
-	if last, ok := s.punchSourceLast[sourceKey]; ok && time.Since(last) < punchPerSourceInterval {
+	{
+		now := time.Now().UnixNano()
+		if last := s.lastPunchTime.Load(); now-last < int64(time.Second)/maxPunchPerSecond {
+			return
+		}
+		// 2. Per-source cap: at most one punch per punchPerSourceInterval.
+		s.punchRateMu.Lock()
+		if last, ok := s.punchSourceLast[sourceKey]; ok && time.Since(last) < punchPerSourceInterval {
+			s.punchRateMu.Unlock()
+			return
+		}
+		s.punchSourceLast[sourceKey] = time.Now()
+		s.lastPunchTime.Store(now)
 		s.punchRateMu.Unlock()
-		return
 	}
-	s.punchSourceLast[sourceKey] = time.Now()
-	s.lastPunchTime.Store(now)
-	s.punchRateMu.Unlock()
+
+rateLimitBypass:
 
 	requesterID := binary.BigEndian.Uint32(data[0:4])
 	targetID := binary.BigEndian.Uint32(data[4:8])
@@ -1147,6 +1170,24 @@ func (s *Server) SetRegistryAdminToken(token string) {
 	s.mu.Lock()
 	s.registryAdminToken = token
 	s.mu.Unlock()
+}
+
+// SetPunchWhitelist replaces the source-IP whitelist for punch-request
+// rate limits (PILOT-342). Entries are matched against remote.IP.String()
+// so callers should pass canonical text-form IPs (IPv4: "10.0.0.1",
+// IPv6: "2001:db8::1" without zone/port). Empty slice clears the
+// whitelist. Safe to call concurrently with handlePunchRequest — the
+// underlying field is an atomic.Pointer.
+func (s *Server) SetPunchWhitelist(ips []string) {
+	m := make(map[string]struct{}, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		m[ip] = struct{}{}
+	}
+	s.punchWhitelist.Store(&m)
 }
 
 // registryDiscoveryLoop registers this beacon with the registry and discovers
