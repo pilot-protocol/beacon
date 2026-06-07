@@ -27,6 +27,7 @@ func main() {
 	registryAdminToken := flag.String("registry-admin-token", "", "admin token for beacon_register auth (required when registry enforces SEC-002)")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
+	punchWhitelist := flag.String("punch-whitelist", "", "PILOT-342: comma-separated source IPs that bypass SEC-026 punch-request rate limits (use for trusted operator boxes, test rigs, paired beacons). Env: BEACON_PUNCH_WHITELIST.")
 	flag.Parse()
 
 	if *configPath != "" {
@@ -59,6 +60,16 @@ func main() {
 	}
 	if *registryAdminToken != "" {
 		s.SetRegistryAdminToken(*registryAdminToken)
+	}
+	// PILOT-342: punch-request whitelist. CLI flag takes precedence over
+	// env so deployments can override per-instance.
+	wlSrc := *punchWhitelist
+	if wlSrc == "" {
+		wlSrc = os.Getenv("BEACON_PUNCH_WHITELIST")
+	}
+	if wlSrc != "" {
+		s.SetPunchWhitelist(strings.Split(wlSrc, ","))
+		slog.Info("punch-request whitelist configured", "ips", strings.Count(wlSrc, ",")+1)
 	}
 
 	if *healthAddr != "" {
