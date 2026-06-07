@@ -62,6 +62,12 @@ type Server struct {
 	// via SetPunchWhitelist, read on every handlePunchRequest under
 	// atomic.Pointer so we don't need a hot-path lock.
 	punchWhitelist atomic.Pointer[map[string]struct{}]
+	// PILOT-342 wildcard: when true, every source bypasses the punch
+	// rate limit. Set by passing "*" via SetPunchWhitelist (or via the
+	// -punch-whitelist flag / BEACON_PUNCH_WHITELIST env). Used on
+	// service-agent hosts where all incoming punches are legitimate
+	// (e.g. specialist boxes that serve high-volume query traffic).
+	punchWhitelistAll atomic.Bool
 
 	// Per-source relay rate limiters (SEC-037).
 	relayRateMu      sync.Mutex                     // protects relaySourceCount
@@ -584,7 +590,12 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 	sourceKey := remote.IP.String()
 	// PILOT-342: whitelisted sources bypass BOTH rate-limit gates. Used
 	// for trusted operator IPs (test rigs, paired beacons) where the
-	// SEC-026 amplification protection is overkill.
+	// SEC-026 amplification protection is overkill. The wildcard
+	// (punchWhitelistAll) covers service-agent hosts that serve
+	// high-volume query traffic from every direction.
+	if s.punchWhitelistAll.Load() {
+		goto rateLimitBypass
+	}
 	if wl := s.punchWhitelist.Load(); wl != nil {
 		if _, ok := (*wl)[sourceKey]; ok {
 			goto rateLimitBypass
@@ -1179,15 +1190,25 @@ func (s *Server) SetRegistryAdminToken(token string) {
 // whitelist. Safe to call concurrently with handlePunchRequest — the
 // underlying field is an atomic.Pointer.
 func (s *Server) SetPunchWhitelist(ips []string) {
+	all := false
 	m := make(map[string]struct{}, len(ips))
 	for _, ip := range ips {
 		ip = strings.TrimSpace(ip)
 		if ip == "" {
 			continue
 		}
+		// PILOT-342 wildcard: "*" or "all" means every source bypasses
+		// the rate limit. Useful on service-agent boxes where the
+		// SEC-026 protection actively interferes with legitimate
+		// high-volume query traffic.
+		if ip == "*" || ip == "all" {
+			all = true
+			continue
+		}
 		m[ip] = struct{}{}
 	}
 	s.punchWhitelist.Store(&m)
+	s.punchWhitelistAll.Store(all)
 }
 
 // registryDiscoveryLoop registers this beacon with the registry and discovers
