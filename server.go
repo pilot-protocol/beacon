@@ -69,6 +69,14 @@ type Server struct {
 	// (e.g. specialist boxes that serve high-volume query traffic).
 	punchWhitelistAll atomic.Bool
 
+	// breakerAllow consults the parent process's breaker manager for
+	// the named beacon switch (beacon.punch, beacon.relay,
+	// beacon.discover). Returns (allow, reason). Open = drop the
+	// inbound message; the sender will retry. Optional — nil means
+	// every name is implicitly closed (allow). Set via SetBreakerAllow
+	// before Serve; race-free reads via atomic.Pointer.
+	breakerAllow atomic.Pointer[func(name string) (bool, string)]
+
 	// Per-source relay rate limiters (SEC-037).
 	relayRateMu      sync.Mutex                     // protects relaySourceCount
 	relaySourceCount map[uint32]*relaySourceWindow   // senderID → sliding window state
@@ -540,6 +548,13 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr) {
 		return
 	}
 
+	// Breaker gate: beacon.discover open = stop replying to STUN-style
+	// discover probes. Existing tunnels are unaffected (they don't
+	// re-discover unless the endpoint moves). New nodes will retry.
+	if open, _ := s.breakerOpen("beacon.discover"); open {
+		return
+	}
+
 	nodeID := binary.BigEndian.Uint32(data[0:4])
 
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
@@ -584,6 +599,14 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr) {
 
 func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 	if len(data) < 8 {
+		return
+	}
+
+	// Breaker gate: beacon.punch open = stop assisting NAT hole-punch
+	// (existing tunnels keep working — sender will fall back to relay
+	// or back off). UDP is best-effort so we just drop, no error path
+	// to surface.
+	if open, _ := s.breakerOpen("beacon.punch"); open {
 		return
 	}
 
@@ -672,6 +695,14 @@ rateLimitBypass:
 // pre-check), no syscalls, no allocations on the hot path.
 func (s *Server) dispatchRelay(data []byte) {
 	if len(data) < 8 {
+		return
+	}
+
+	// Breaker gate: beacon.relay open = stop forwarding. Senders
+	// retry; nothing else to do here (no error path to surface back
+	// over UDP).
+	if open, _ := s.breakerOpen("beacon.relay"); open {
+		s.relayDropped.Add(1)
 		return
 	}
 
@@ -1189,6 +1220,31 @@ func (s *Server) SetRegistryAdminToken(token string) {
 // IPv6: "2001:db8::1" without zone/port). Empty slice clears the
 // whitelist. Safe to call concurrently with handlePunchRequest — the
 // underlying field is an atomic.Pointer.
+// SetBreakerAllow installs the parent process's breaker-query callback.
+// When set, the beacon consults it before serving each punch / relay /
+// discover request; Open drops the message silently (the sender's
+// regular retry takes over). Pass nil to disable. Safe to call after
+// Serve has started.
+func (s *Server) SetBreakerAllow(fn func(name string) (bool, string)) {
+	if fn == nil {
+		s.breakerAllow.Store(nil)
+		return
+	}
+	s.breakerAllow.Store(&fn)
+}
+
+// breakerOpen returns true when the named breaker is Open and inbound
+// messages on that surface should be dropped. Returns false when no
+// callback is registered or the breaker is Closed / HalfOpen.
+func (s *Server) breakerOpen(name string) (bool, string) {
+	fnPtr := s.breakerAllow.Load()
+	if fnPtr == nil {
+		return false, ""
+	}
+	allow, reason := (*fnPtr)(name)
+	return !allow, reason
+}
+
 func (s *Server) SetPunchWhitelist(ips []string) {
 	all := false
 	m := make(map[string]struct{}, len(ips))
