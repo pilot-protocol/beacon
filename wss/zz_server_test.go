@@ -582,6 +582,98 @@ func TestServer_RejectsOversizedFrame(t *testing.T) {
 	}
 }
 
+// TestServer_EmptyFrameDoesNotPanic is the WSS-path pin for PILOT-70.
+//
+// Before the fix in beacon/server.go, a 0-byte binary frame from any
+// authenticated WSS peer would reach handlePacket with len(data)==0 and
+// panic on data[0]. The UDP readLoop already screened empty frames, but
+// the WSS OnFrame callback (wss/server.go peerReadLoop) only enforced an
+// UPPER bound — a zero-length frame bypassed it and crashed the beacon.
+//
+// This test exercises the full end-to-end WSS path:
+//
+//	daemon Send([]byte{}) → peerReadLoop → OnFrame(senderID, []byte{}) → handlePacket
+//
+// It asserts:
+//  1. The connection stays alive (the server does not drop the peer for
+//     sending an empty frame — that would be correct behaviour too, but
+//     the important property is no panic).
+//  2. A subsequent normal frame is delivered, proving the conn is healthy.
+func TestServer_EmptyFrameDoesNotPanic(t *testing.T) {
+	t.Parallel()
+	id, _ := crypto.GenerateIdentity()
+	nodeID := uint32(6666)
+
+	// onFrame records all frames delivered to the callback.
+	var (
+		frameMu sync.Mutex
+		gotFrames [][]byte
+	)
+	s, err := wss.New(wss.Config{
+		BindAddr:    "127.0.0.1:0",
+		AuthTimeout: 2 * time.Second,
+		IdleTimeout: 30 * time.Second,
+		PubKeyLookup: func(nid uint32) (ed25519.PublicKey, bool) {
+			if nid == nodeID {
+				return ed25519.PublicKey(id.PublicKey), true
+			}
+			return nil, false
+		},
+		OnFrame: func(senderID uint32, frame []byte) {
+			cp := make([]byte, len(frame))
+			copy(cp, frame)
+			frameMu.Lock()
+			gotFrames = append(gotFrames, cp)
+			frameMu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("wss.New: %v", err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Server.Start: %v", err)
+	}
+	defer s.Close()
+	wsURL := waitForServer(t, s)
+
+	tr := mustDialDaemon(t, wsURL, id, nodeID)
+	defer tr.Close()
+
+	if !waitForCondition(500*time.Millisecond, func() bool { return s.IsConnected(nodeID) }) {
+		t.Fatal("peer never appeared as connected on server")
+	}
+
+	// Send the zero-length frame. This must not panic the server.
+	if _, err := tr.Send([]byte{}, nil); err != nil {
+		t.Fatalf("Send(empty): %v", err)
+	}
+
+	// Give the server read loop time to process the empty frame.
+	time.Sleep(50 * time.Millisecond)
+
+	// A subsequent normal frame must still be delivered, proving the conn
+	// survived the empty frame without being torn down.
+	sentinel := []byte("after-empty")
+	if _, err := tr.Send(sentinel, nil); err != nil {
+		t.Fatalf("Send(sentinel): %v", err)
+	}
+
+	if !waitForCondition(500*time.Millisecond, func() bool {
+		frameMu.Lock()
+		defer frameMu.Unlock()
+		for _, f := range gotFrames {
+			if string(f) == string(sentinel) {
+				return true
+			}
+		}
+		return false
+	}) {
+		frameMu.Lock()
+		t.Errorf("sentinel frame never delivered; got %d frames: %v", len(gotFrames), gotFrames)
+		frameMu.Unlock()
+	}
+}
+
 // Sanity: keep imports used. Some of these are pulled in by sub-tests
 // only; the unused-import linter is happier with the references.
 var (
