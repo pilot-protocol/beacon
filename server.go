@@ -41,6 +41,7 @@ type Server struct {
 	conns          []*net.UDPConn     // SO_REUSEPORT sockets — one per reader goroutine
 	sendBatchConns []*ipv4.PacketConn // ipv4 wrappers of conns[i] for WriteBatch (sendmmsg) — one per worker fd
 	nodes          *nodeMap           // sharded node_id → observed endpoint + last-seen
+	dstNodes       sync.Map           // node_id → struct{}: endpoints that requested dest-carrying delivery (0x09)
 	readyCh        chan struct{}
 	relayCh        chan relayJob // buffered channel for relay workers
 	pool           sync.Pool     // reusable payload buffers (inner relay payload)
@@ -531,7 +532,9 @@ func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
 
 	switch msgType {
 	case protocol.BeaconMsgDiscover:
-		s.handleDiscover(data[1:], remote)
+		s.handleDiscover(data[1:], remote, false)
+	case protocol.BeaconMsgDiscoverEx:
+		s.handleDiscover(data[1:], remote, true)
 	case protocol.BeaconMsgPunchRequest:
 		s.handlePunchRequest(data[1:], remote)
 	case protocol.BeaconMsgRelay:
@@ -543,7 +546,7 @@ func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
 	}
 }
 
-func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr) {
+func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool) {
 	if len(data) < 4 {
 		return
 	}
@@ -556,6 +559,13 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr) {
 	}
 
 	nodeID := binary.BigEndian.Uint32(data[0:4])
+
+	// This endpoint requested destination-carrying delivery; remember the
+	// node id so its final-hop relay frames include the destination (0x09),
+	// letting the receiver resolve which local endpoint the frame is for.
+	if wantDest {
+		s.dstNodes.Store(nodeID, struct{}{})
+	}
 
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
 	// nodeID from flapping its endpoint via rapid Discover messages.
@@ -925,10 +935,20 @@ func (s *Server) relayWorker(sendConn *ipv4.PacketConn) {
 			var addr *net.UDPAddr
 			if localOk {
 				addr = localAddr
-				outBuf = outBuf[:1+4+len(job.payload)]
-				outBuf[0] = protocol.BeaconMsgRelayDeliver
-				binary.BigEndian.PutUint32(outBuf[1:5], job.senderID)
-				copy(outBuf[5:], job.payload)
+				if _, wantDest := s.dstNodes.Load(job.destID); wantDest {
+					// Destination-carrying endpoint: include the dest node id
+					// so the receiver can resolve which endpoint the frame is for.
+					outBuf = outBuf[:1+4+4+len(job.payload)]
+					outBuf[0] = protocol.BeaconMsgRelayDeliverDest
+					binary.BigEndian.PutUint32(outBuf[1:5], job.senderID)
+					binary.BigEndian.PutUint32(outBuf[5:9], job.destID)
+					copy(outBuf[9:], job.payload)
+				} else {
+					outBuf = outBuf[:1+4+len(job.payload)]
+					outBuf[0] = protocol.BeaconMsgRelayDeliver
+					binary.BigEndian.PutUint32(outBuf[1:5], job.senderID)
+					copy(outBuf[5:], job.payload)
+				}
 			} else {
 				// Tier 2: peer beacon lookup. peerNodes is an
 				// atomic.Pointer; reads are lock-free.
