@@ -21,7 +21,7 @@ jobs:
       - name: Checkout web4
         uses: actions/checkout@v7
         with:
-          repository: TeoSlayer/pilotprotocol
+          repository: pilot-protocol/pilotprotocol
           path: web4
 
       - uses: actions/setup-go@v6
