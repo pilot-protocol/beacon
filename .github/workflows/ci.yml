@@ -24,7 +24,7 @@ jobs:
           repository: pilot-protocol/pilotprotocol
           path: web4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: beacon/go.mod
           cache: true
