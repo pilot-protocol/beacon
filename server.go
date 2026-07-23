@@ -3,6 +3,7 @@
 package beacon
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -70,6 +71,9 @@ type Server struct {
 	// service-agent hosts where all incoming punches are legitimate
 	// (e.g. specialist boxes that serve high-volume query traffic).
 	punchWhitelistAll atomic.Bool
+
+	requirePunchToken atomic.Bool
+	nodePubKeys       sync.Map
 
 	// breakerAllow consults the parent process's breaker manager for
 	// the named beacon switch (beacon.punch, beacon.relay,
@@ -572,6 +576,12 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 		s.dstNodes.Store(nodeID, struct{}{})
 	}
 
+	if len(data) >= 4+ed25519.PublicKeySize {
+		pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+		copy(pub, data[4:4+ed25519.PublicKeySize])
+		s.nodePubKeys.Store(nodeID, pub)
+	}
+
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
 	// nodeID from flapping its endpoint via rapid Discover messages.
 	s.discoverRateMu.Lock()
@@ -610,6 +620,30 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 	if _, err := s.conn.WriteToUDP(reply, remote); err != nil {
 		slog.Debug("beacon discover reply failed", "node_id", nodeID, "err", err)
 	}
+}
+
+const punchGrantExpirySize = 8
+const punchGrantTrailerSize = punchGrantExpirySize + ed25519.SignatureSize
+
+func (s *Server) verifyPunchGrant(trailer []byte, requesterID, targetID uint32) bool {
+	if len(trailer) < punchGrantTrailerSize {
+		return false
+	}
+	expiry := int64(binary.BigEndian.Uint64(trailer[0:punchGrantExpirySize]))
+	if time.Now().Unix() > expiry {
+		return false
+	}
+	sig := trailer[punchGrantExpirySize : punchGrantExpirySize+ed25519.SignatureSize]
+	v, ok := s.nodePubKeys.Load(targetID)
+	if !ok {
+		return false
+	}
+	pub, ok := v.(ed25519.PublicKey)
+	if !ok || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	preimage := fmt.Sprintf("punch-grant:%d:%d:%d", requesterID, targetID, expiry)
+	return ed25519.Verify(pub, []byte(preimage), sig)
 }
 
 func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
@@ -662,6 +696,12 @@ rateLimitBypass:
 
 	requesterID := binary.BigEndian.Uint32(data[0:4])
 	targetID := binary.BigEndian.Uint32(data[4:8])
+
+	if s.requirePunchToken.Load() {
+		if !s.verifyPunchGrant(data[8:], requesterID, targetID) {
+			return
+		}
+	}
 
 	// Update requester's endpoint (handles symmetric NAT port changes).
 	s.nodes.Upsert(requesterID, remote, time.Now(), maxBeaconNodes)
@@ -1177,6 +1217,14 @@ func (s *Server) reapStaleNodes() {
 		}
 	}
 	s.discoverRateMu.Unlock()
+
+	s.nodePubKeys.Range(func(k, _ interface{}) bool {
+		id, ok := k.(uint32)
+		if ok && !s.nodes.Has(id) {
+			s.nodePubKeys.Delete(k)
+		}
+		return true
+	})
 }
 
 // --- Gossip ---
@@ -1356,6 +1404,10 @@ func (s *Server) SetPunchWhitelist(ips []string) {
 	}
 	s.punchWhitelist.Store(&m)
 	s.punchWhitelistAll.Store(all)
+}
+
+func (s *Server) SetRequirePunchToken(v bool) {
+	s.requirePunchToken.Store(v)
 }
 
 // registryDiscoveryLoop registers this beacon with the registry and discovers
