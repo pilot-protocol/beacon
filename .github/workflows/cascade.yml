@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write   # tag-bump lands bumps via PR + auto-merge
 
 jobs:
   bump:
@@ -36,3 +37,4 @@ jobs:
       version: ${{ inputs.version || github.event.client_payload.version }}
       is_prerelease: ${{ inputs.is_prerelease == true || github.event.client_payload.is_prerelease == true }}
       stable_only: true
+    secrets: inherit
