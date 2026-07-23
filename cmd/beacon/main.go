@@ -28,6 +28,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
 	punchWhitelist := flag.String("punch-whitelist", "", "PILOT-342: comma-separated source IPs that bypass SEC-026 punch-request rate limits (use for trusted operator boxes, test rigs, paired beacons). Env: BEACON_PUNCH_WHITELIST.")
+	requirePunchToken := flag.Bool("require-punch-token", false, "WS3: require a valid target-issued punch token before releasing a peer endpoint. Default false (not enforcing, wire-compatible with old agents). Env: BEACON_REQUIRE_PUNCH_TOKEN=1.")
 	flag.Parse()
 
 	if *configPath != "" {
@@ -70,6 +71,10 @@ func main() {
 	if wlSrc != "" {
 		s.SetPunchWhitelist(strings.Split(wlSrc, ","))
 		slog.Info("punch-request whitelist configured", "ips", strings.Count(wlSrc, ",")+1)
+	}
+	if *requirePunchToken || os.Getenv("BEACON_REQUIRE_PUNCH_TOKEN") == "1" {
+		s.SetRequirePunchToken(true)
+		slog.Info("punch-token enforcement enabled (WS3)")
 	}
 
 	if *healthAddr != "" {

@@ -3,6 +3,7 @@
 package beacon
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,7 @@ type Server struct {
 	conn           *net.UDPConn       // primary read+write socket; equal to conns[0]
 	conns          []*net.UDPConn     // SO_REUSEPORT sockets — one per reader goroutine
 	sendBatchConns []*ipv4.PacketConn // ipv4 wrappers of conns[i] for WriteBatch (sendmmsg) — one per worker fd
+	sendRawConns   []*net.UDPConn     // raw conns[i], parallel to sendBatchConns — used for the per-packet WriteToUDP fallback when WriteBatch fails (e.g. dual-stack [::] socket + IPv4 destination, which sendmmsg via ipv4.PacketConn rejects with "invalid argument")
 	nodes          *nodeMap           // sharded node_id → observed endpoint + last-seen
 	dstNodes       sync.Map           // node_id → struct{}: endpoints that requested dest-carrying delivery (0x09)
 	readyCh        chan struct{}
@@ -69,6 +71,9 @@ type Server struct {
 	// service-agent hosts where all incoming punches are legitimate
 	// (e.g. specialist boxes that serve high-volume query traffic).
 	punchWhitelistAll atomic.Bool
+
+	requirePunchToken atomic.Bool
+	nodePubKeys       sync.Map
 
 	// breakerAllow consults the parent process's breaker manager for
 	// the named beacon switch (beacon.punch, beacon.relay,
@@ -371,11 +376,14 @@ func (s *Server) ListenAndServe(addr string) error {
 	}
 	if sharedPort {
 		s.sendBatchConns = make([]*ipv4.PacketConn, len(s.conns))
+		s.sendRawConns = make([]*net.UDPConn, len(s.conns))
 		for i, c := range s.conns {
 			s.sendBatchConns[i] = ipv4.NewPacketConn(c)
+			s.sendRawConns[i] = c
 		}
 	} else {
 		s.sendBatchConns = []*ipv4.PacketConn{ipv4.NewPacketConn(s.conn)}
+		s.sendRawConns = []*net.UDPConn{s.conn}
 	}
 
 	slog.Info("beacon listening", "addr", s.conn.LocalAddr(), "beacon_id", s.beaconID, "peers", len(s.peers), "readers", readers)
@@ -400,7 +408,8 @@ func (s *Server) ListenAndServe(addr string) error {
 		workers = 8
 	}
 	for i := 0; i < workers; i++ {
-		go s.relayWorker(s.sendBatchConns[i%len(s.sendBatchConns)])
+		idx := i % len(s.sendBatchConns)
+		go s.relayWorker(s.sendBatchConns[idx], s.sendRawConns[idx])
 	}
 
 	// Start relay stats logger (every 60s)
@@ -567,6 +576,12 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 		s.dstNodes.Store(nodeID, struct{}{})
 	}
 
+	if len(data) >= 4+ed25519.PublicKeySize {
+		pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+		copy(pub, data[4:4+ed25519.PublicKeySize])
+		s.nodePubKeys.Store(nodeID, pub)
+	}
+
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
 	// nodeID from flapping its endpoint via rapid Discover messages.
 	s.discoverRateMu.Lock()
@@ -605,6 +620,30 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 	if _, err := s.conn.WriteToUDP(reply, remote); err != nil {
 		slog.Debug("beacon discover reply failed", "node_id", nodeID, "err", err)
 	}
+}
+
+const punchGrantExpirySize = 8
+const punchGrantTrailerSize = punchGrantExpirySize + ed25519.SignatureSize
+
+func (s *Server) verifyPunchGrant(trailer []byte, requesterID, targetID uint32) bool {
+	if len(trailer) < punchGrantTrailerSize {
+		return false
+	}
+	expiry := int64(binary.BigEndian.Uint64(trailer[0:punchGrantExpirySize]))
+	if time.Now().Unix() > expiry {
+		return false
+	}
+	sig := trailer[punchGrantExpirySize : punchGrantExpirySize+ed25519.SignatureSize]
+	v, ok := s.nodePubKeys.Load(targetID)
+	if !ok {
+		return false
+	}
+	pub, ok := v.(ed25519.PublicKey)
+	if !ok || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	preimage := fmt.Sprintf("punch-grant:%d:%d:%d", requesterID, targetID, expiry)
+	return ed25519.Verify(pub, []byte(preimage), sig)
 }
 
 func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
@@ -657,6 +696,12 @@ rateLimitBypass:
 
 	requesterID := binary.BigEndian.Uint32(data[0:4])
 	targetID := binary.BigEndian.Uint32(data[4:8])
+
+	if s.requirePunchToken.Load() {
+		if !s.verifyPunchGrant(data[8:], requesterID, targetID) {
+			return
+		}
+	}
 
 	// Update requester's endpoint (handles symmetric NAT port changes).
 	s.nodes.Upsert(requesterID, remote, time.Now(), maxBeaconNodes)
@@ -851,18 +896,67 @@ const relayFlushAfter = 2 * time.Millisecond
 // WriteBatch globally — the send-side bottleneck before fan-out.
 // With per-fd workers, sends parallelise across fds and the only
 // serialisation left is per-worker (its own batch state).
-func (s *Server) relayWorker(sendConn *ipv4.PacketConn) {
+func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) {
 	msgs := make([]ipv4.Message, 0, relayBatchCap)
 	payloadsToReturn := make([][]byte, 0, relayBatchCap)
 	outBufsToReturn := make([]*[]byte, 0, relayBatchCap)
+
+	// sendmmsg via ipv4.PacketConn.WriteBatch rejects the whole batch with
+	// EINVAL ("invalid argument") when the send socket is bound to the
+	// IPv6/dual-stack wildcard ([::]) and a destination carries an IPv4
+	// address — the common case, because production binds the beacon to
+	// ":9001" which resolves to [::]:9001 on Linux and the node fleet is
+	// IPv4. The result was that EVERY relay-deliver to an IPv4 node failed
+	// here, silently blackholing relay-only nodes. When the send socket is
+	// dual-stack we can't use the batch fast path for those, so route the
+	// flush through per-packet WriteToUDP on the raw conn (which maps IPv4
+	// destinations onto the dual-stack socket correctly). On an IPv4-bound
+	// socket the sendmmsg fast path is unaffected.
+	sendDualStack := isWildcardIPv6(rawConn.LocalAddr())
+
+	writeToUDPFlush := func() (sent int) {
+		for i := range msgs {
+			dst, ok := msgs[i].Addr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			if _, werr := rawConn.WriteToUDP(msgs[i].Buffers[0], dst); werr == nil {
+				sent++
+			} else {
+				slog.Debug("relay per-packet send failed", "dst", dst, "err", werr)
+			}
+		}
+		return sent
+	}
 
 	flush := func() {
 		if len(msgs) == 0 {
 			return
 		}
-		n, err := sendConn.WriteBatch(msgs, 0)
-		if err != nil {
-			slog.Debug("relay write batch failed", "n", n, "of", len(msgs), "err", err)
+		var n int
+		if sendDualStack {
+			n = writeToUDPFlush()
+		} else {
+			var err error
+			n, err = sendConn.WriteBatch(msgs, 0)
+			if err != nil {
+				// Unexpected on an IPv4-bound socket, but fall back to
+				// per-packet for the messages the batch didn't send rather
+				// than dropping them.
+				slog.Debug("relay write batch failed, falling back to per-packet send",
+					"n", n, "of", len(msgs), "err", err)
+				for i := n; i < len(msgs); i++ {
+					dst, ok := msgs[i].Addr.(*net.UDPAddr)
+					if !ok {
+						continue
+					}
+					if _, werr := rawConn.WriteToUDP(msgs[i].Buffers[0], dst); werr == nil {
+						n++
+					} else {
+						slog.Debug("relay per-packet fallback send failed", "dst", dst, "err", werr)
+					}
+				}
+			}
 		}
 		if n > 0 {
 			s.relayForwarded.Add(uint64(n))
@@ -1001,6 +1095,23 @@ func (s *Server) relayWorker(sendConn *ipv4.PacketConn) {
 	}
 }
 
+// isWildcardIPv6 reports whether addr is an IPv6/dual-stack UDP socket (e.g.
+// bound to [::] from a ":port" listen). On such a socket, sendmmsg via
+// ipv4.PacketConn.WriteBatch fails with EINVAL for IPv4 destinations, so the
+// relay worker must use per-packet WriteToUDP (which maps IPv4 destinations
+// onto the dual-stack socket correctly). A socket bound to an IPv4 address
+// (including 0.0.0.0) keeps the batch fast path.
+func isWildcardIPv6(addr net.Addr) bool {
+	ua, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	// To4()==nil means the local bind is genuinely IPv6 (not IPv4 / not an
+	// IPv4-mapped form). That's exactly the case where WriteBatch chokes on
+	// IPv4 destinations.
+	return ua.IP.To4() == nil
+}
+
 func (s *Server) returnPayload(buf []byte) {
 	buf = buf[:cap(buf)]
 	s.pool.Put(&buf)
@@ -1106,6 +1217,14 @@ func (s *Server) reapStaleNodes() {
 		}
 	}
 	s.discoverRateMu.Unlock()
+
+	s.nodePubKeys.Range(func(k, _ interface{}) bool {
+		id, ok := k.(uint32)
+		if ok && !s.nodes.Has(id) {
+			s.nodePubKeys.Delete(k)
+		}
+		return true
+	})
 }
 
 // --- Gossip ---
@@ -1285,6 +1404,10 @@ func (s *Server) SetPunchWhitelist(ips []string) {
 	}
 	s.punchWhitelist.Store(&m)
 	s.punchWhitelistAll.Store(all)
+}
+
+func (s *Server) SetRequirePunchToken(v bool) {
+	s.requirePunchToken.Store(v)
 }
 
 // registryDiscoveryLoop registers this beacon with the registry and discovers
