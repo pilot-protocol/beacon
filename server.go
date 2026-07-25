@@ -56,10 +56,10 @@ type Server struct {
 	lastDropLog     atomic.Int64  // UnixNano of last drop warning (rate limit)
 	lastNotFoundLog atomic.Int64  // UnixNano of last not-found warning (rate limit)
 
-	// Punch-request rate limiters (SEC-026).
-	punchRateMu     sync.Mutex           // protects punchSourceLast
-	punchSourceLast map[string]time.Time // source IP → last allowed punch time
-	lastPunchTime   atomic.Int64         // UnixNano of last global punch (rate limit)
+	// Punch-request rate limiters (SEC-026). Sharded per source IP so the
+	// per-source cap does not serialise all readers on one lock.
+	punchRL       *punchRateLimiter
+	lastPunchTime atomic.Int64 // UnixNano of last global punch (rate limit)
 	// PILOT-342: source-IP whitelist. Sources in this set bypass BOTH the
 	// per-source and the global punch-rate caps. Written once at startup
 	// via SetPunchWhitelist, read on every handlePunchRequest under
@@ -83,13 +83,12 @@ type Server struct {
 	// before Serve; race-free reads via atomic.Pointer.
 	breakerAllow atomic.Pointer[func(name string) (bool, string)]
 
-	// Per-source relay rate limiters (SEC-037).
-	relayRateMu      sync.Mutex                     // protects relaySourceCount
-	relaySourceCount map[uint32]*relaySourceWindow   // senderID → sliding window state
+	// Per-source relay rate limiters (SEC-037). Sharded per senderID.
+	relayRL *relayRateLimiter
 
-	// Per-nodeID discover rate limiter (PILOT-334) — prevents endpoint flapping.
-	discoverRateMu   sync.Mutex
-	discoverRateLast map[uint32]time.Time // nodeID → last allowed discover endpoint update
+	// Per-nodeID discover rate limiter (PILOT-334) — prevents endpoint
+	// flapping. Sharded per nodeID.
+	discoverRL *discoverRateLimiter
 
 	// Peer mesh (gossip)
 	beaconID    uint32
@@ -184,9 +183,9 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 		relayCh:  make(chan relayJob, relayQueueSize),
 		beaconID: beaconID,
 		done:     make(chan struct{}),
-		punchSourceLast:  make(map[string]time.Time),
-		relaySourceCount: make(map[uint32]*relaySourceWindow),
-		discoverRateLast: make(map[uint32]time.Time),
+		punchRL:    newPunchRateLimiter(),
+		relayRL:    newRelayRateLimiter(),
+		discoverRL: newDiscoverRateLimiter(),
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
@@ -627,16 +626,10 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 	}
 
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
-	// nodeID from flapping its endpoint via rapid Discover messages.
-	s.discoverRateMu.Lock()
-	if last, ok := s.discoverRateLast[nodeID]; ok && time.Since(last) < discoverMinInterval {
-		s.discoverRateMu.Unlock()
-		// Rate-limited: skip the Upsert but still reply with the
-		// observed address so the node learns its public endpoint.
-	} else {
-		s.discoverRateLast[nodeID] = time.Now()
-		s.discoverRateMu.Unlock()
-		// Record this node's observed public endpoint. Sharded — no global lock.
+	// nodeID from flapping its endpoint via rapid Discover messages. When
+	// rate-limited we skip the Upsert but still reply with the observed
+	// address so the node learns its public endpoint.
+	if s.discoverRL.allow(nodeID, discoverMinInterval) {
 		if _, atCap := s.nodes.Upsert(nodeID, remote, time.Now(), maxBeaconNodes); atCap {
 			return // shard at capacity — drop silently
 		}
@@ -743,14 +736,10 @@ func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
 			return
 		}
 		// 2. Per-source cap: at most one punch per punchPerSourceInterval.
-		s.punchRateMu.Lock()
-		if last, ok := s.punchSourceLast[sourceKey]; ok && time.Since(last) < punchPerSourceInterval {
-			s.punchRateMu.Unlock()
+		if !s.punchRL.allow(sourceKey, punchPerSourceInterval) {
 			return
 		}
-		s.punchSourceLast[sourceKey] = time.Now()
 		s.lastPunchTime.Store(now)
-		s.punchRateMu.Unlock()
 	}
 
 rateLimitBypass:
@@ -876,22 +865,12 @@ func (s *Server) dispatchRelay(data []byte) {
 	// a known destination can saturate the 524288-deep relayCh at rates
 	// far above normal — this cap gives each source a fixed share.
 	now := time.Now().UnixNano()
-	s.relayRateMu.Lock()
-	w, ok := s.relaySourceCount[senderID]
-	if !ok || now-w.windowStart >= int64(time.Second) {
-		// New 1-second window.
-		s.relaySourceCount[senderID] = &relaySourceWindow{windowStart: now, count: 1}
-		s.relayRateMu.Unlock()
-	} else if w.count >= maxRelaysPerSourcePerSecond {
-		// Source exceeded per-second budget — silently drop.
-		// The sender's daemon retries (3-attempt path in
-		// pkg/daemon/daemon.go relay branch), so a drop here
-		// is eventually self-healing for honest senders.
-		s.relayRateMu.Unlock()
+	// Source exceeded per-second budget — silently drop. The sender's
+	// daemon retries (3-attempt path in pkg/daemon/daemon.go relay
+	// branch), so a drop here is eventually self-healing for honest
+	// senders.
+	if !s.relayRL.allow(senderID, now, maxRelaysPerSourcePerSecond) {
 		return
-	} else {
-		w.count++
-		s.relayRateMu.Unlock()
 	}
 
 	// Copy payload into a pooled buffer so we don't hold the read buffer
@@ -1274,35 +1253,10 @@ func (s *Server) reapStaleNodes() {
 	threshold := time.Now().Add(-beaconNodeTTL)
 	s.nodes.ReapStale(threshold)
 
-	// Sweep stale punch-rate entries to prevent unbounded map growth.
-	s.punchRateMu.Lock()
-	cutoff := time.Now().Add(-punchRateCleanupInterval)
-	for ip, last := range s.punchSourceLast {
-		if last.Before(cutoff) {
-			delete(s.punchSourceLast, ip)
-		}
-	}
-	s.punchRateMu.Unlock()
-
-	// Sweep stale relay-source entries.
-	s.relayRateMu.Lock()
-	cutoffNs := time.Now().Add(-relaySourceCleanupInterval).UnixNano()
-	for id, w := range s.relaySourceCount {
-		if w.windowStart < cutoffNs {
-			delete(s.relaySourceCount, id)
-		}
-	}
-	s.relayRateMu.Unlock()
-
-	// Sweep stale discover-rate entries (PILOT-334).
-	s.discoverRateMu.Lock()
-	discoverCutoff := time.Now().Add(-discoverMinInterval * 2)
-	for id, last := range s.discoverRateLast {
-		if last.Before(discoverCutoff) {
-			delete(s.discoverRateLast, id)
-		}
-	}
-	s.discoverRateMu.Unlock()
+	// Sweep stale rate-limiter entries to prevent unbounded map growth.
+	s.punchRL.sweep(time.Now().Add(-punchRateCleanupInterval))
+	s.relayRL.sweep(time.Now().Add(-relaySourceCleanupInterval).UnixNano())
+	s.discoverRL.sweep(time.Now().Add(-discoverMinInterval * 2))
 
 	s.nodePubKeys.Range(func(k, _ interface{}) bool {
 		id, ok := k.(uint32)
