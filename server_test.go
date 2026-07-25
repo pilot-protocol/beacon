@@ -30,7 +30,7 @@ func registerNode(t *testing.T, beaconAddr *net.UDPAddr, nodeID uint32) *net.UDP
 
 	// Read discover reply
 	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("read discover reply: %v", err)

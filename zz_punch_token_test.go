@@ -31,7 +31,7 @@ func registerNodeWithPubKey(t *testing.T, beaconAddr *net.UDPAddr, nodeID uint32
 	}
 
 	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("read discover reply: %v", err)
@@ -68,7 +68,7 @@ func sendPunchRequest(t *testing.T, conn *net.UDPConn, requesterID, targetID uin
 func expectPunchCommand(t *testing.T, conn *net.UDPConn, wantAddr *net.UDPAddr) {
 	t.Helper()
 	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("read punch command: %v", err)

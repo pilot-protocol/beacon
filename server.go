@@ -109,6 +109,8 @@ type Server struct {
 	// handlePacket the same way UDP datagrams do.
 	wssServer *bwss.Server
 
+	authKeyLookup atomic.Pointer[authKeyLookupFn]
+
 	done chan struct{} // closed on shutdown
 
 	// Close idempotency. The actual teardown runs at most once
@@ -217,6 +219,16 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 	return s
 }
 
+type authKeyLookupFn func(nodeID uint32) (ed25519.PublicKey, bool)
+
+func (s *Server) SetAuthoritativeKeyLookup(fn authKeyLookupFn) {
+	if fn == nil {
+		s.authKeyLookup.Store(nil)
+		return
+	}
+	s.authKeyLookup.Store(&fn)
+}
+
 // EnableCompatWSS attaches a WSS-bridge listener for compat-mode
 // daemons. After Start, the beacon's relay worker checks the WSS
 // peer map BEFORE the UDP tier-1/2 lookups: relay packets destined
@@ -234,6 +246,11 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 func (s *Server) EnableCompatWSS(bindAddr string, pubKeyLookup bwss.PubKeyLookupFn) error {
 	if s.wssServer != nil {
 		return fmt.Errorf("beacon: compat WSS already enabled")
+	}
+	if pubKeyLookup != nil {
+		s.SetAuthoritativeKeyLookup(func(id uint32) (ed25519.PublicKey, bool) {
+			return pubKeyLookup(id)
+		})
 	}
 	ws, err := bwss.New(bwss.Config{
 		BindAddr:     bindAddr,
@@ -454,18 +471,40 @@ const readBatchCap = 32
 // allocation contention. On non-Linux platforms the x/net/ipv4
 // fallback degrades to per-message ReadFrom, preserving correctness.
 func (s *Server) readLoop(conn *net.UDPConn) error {
+	// A panic on the receive path must not silently retire this socket's
+	// reader: recover, log, and resume the batch loop. Only a closed
+	// socket ends it. The per-packet boundary lives in handlePacket; this
+	// one covers the batch bookkeeping around it.
+	for {
+		err, done := s.readLoopBatches(conn)
+		if done {
+			return err
+		}
+		select {
+		case <-s.done:
+			return nil
+		default:
+		}
+	}
+}
+
+// readLoopBatches runs the recvmmsg loop until the socket closes (done=true)
+// or a panic unwinds it (done=false, caller resumes).
+func (s *Server) readLoopBatches(conn *net.UDPConn) (err error, done bool) {
+	defer recoverHandler("readLoop")
+
 	pc := ipv4.NewPacketConn(conn)
 	msgs := make([]ipv4.Message, readBatchCap)
 	for i := range msgs {
 		msgs[i].Buffers = [][]byte{make([]byte, 65535)}
 	}
 	for {
-		n, err := pc.ReadBatch(msgs, 0)
-		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-				return nil
+		n, rerr := pc.ReadBatch(msgs, 0)
+		if rerr != nil {
+			if opErr, ok := rerr.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+				return nil, true
 			}
-			slog.Debug("beacon read batch error", "err", err)
+			slog.Debug("beacon read batch error", "err", rerr)
 			continue
 		}
 		for i := 0; i < n; i++ {
@@ -530,6 +569,11 @@ func (s *Server) RelayDropped() uint64 { return s.relayDropped.Load() }
 func (s *Server) RelayNotFound() uint64 { return s.relayNotFound.Load() }
 
 func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
+	// Outermost defer: a panic anywhere in the dispatch below drops this
+	// one datagram and leaves the read loop running. Every inbound packet
+	// on this path is unauthenticated remote input.
+	defer recoverHandler("handlePacket")
+
 	// Empty-frame guard. The UDP readLoop screens len(data)<1, but the
 	// WSS OnFrame path only enforces an upper bound — a 0-byte binary
 	// frame from any authenticated WSS peer used to crash the beacon
@@ -579,7 +623,7 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 	if len(data) >= 4+ed25519.PublicKeySize {
 		pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
 		copy(pub, data[4:4+ed25519.PublicKeySize])
-		s.nodePubKeys.Store(nodeID, pub)
+		s.nodePubKeys.LoadOrStore(nodeID, pub)
 	}
 
 	// Per-nodeID endpoint update rate limit (PILOT-334) — prevents a single
@@ -617,6 +661,12 @@ func (s *Server) handleDiscover(data []byte, remote *net.UDPAddr, wantDest bool)
 	copy(reply[2:2+len(ip)], ip)
 	binary.BigEndian.PutUint16(reply[2+len(ip):], uint16(remote.Port))
 
+	// The compat WSS bridge starts accepting frames in EnableCompatWSS,
+	// which runs before ListenAndServe binds the UDP sockets — a frame
+	// arriving in that window reaches here with no socket to reply on.
+	if s.conn == nil {
+		return
+	}
 	if _, err := s.conn.WriteToUDP(reply, remote); err != nil {
 		slog.Debug("beacon discover reply failed", "node_id", nodeID, "err", err)
 	}
@@ -634,16 +684,27 @@ func (s *Server) verifyPunchGrant(trailer []byte, requesterID, targetID uint32) 
 		return false
 	}
 	sig := trailer[punchGrantExpirySize : punchGrantExpirySize+ed25519.SignatureSize]
-	v, ok := s.nodePubKeys.Load(targetID)
-	if !ok {
-		return false
-	}
-	pub, ok := v.(ed25519.PublicKey)
+	pub, ok := s.targetPubKey(targetID)
 	if !ok || len(pub) != ed25519.PublicKeySize {
 		return false
 	}
 	preimage := fmt.Sprintf("punch-grant:%d:%d:%d", requesterID, targetID, expiry)
 	return ed25519.Verify(pub, []byte(preimage), sig)
+}
+
+func (s *Server) targetPubKey(targetID uint32) (ed25519.PublicKey, bool) {
+	if p := s.authKeyLookup.Load(); p != nil {
+		return (*p)(targetID)
+	}
+	v, ok := s.nodePubKeys.Load(targetID)
+	if !ok {
+		return nil, false
+	}
+	pub, ok := v.(ed25519.PublicKey)
+	if !ok {
+		return nil, false
+	}
+	return pub, true
 }
 
 func (s *Server) handlePunchRequest(data []byte, remote *net.UDPAddr) {
@@ -897,6 +958,26 @@ const relayFlushAfter = 2 * time.Millisecond
 // With per-fd workers, sends parallelise across fds and the only
 // serialisation left is per-worker (its own batch state).
 func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) {
+	// A panic while shaping one relay job must not permanently retire this
+	// worker — that would cut the beacon's drain capacity by 1/N for the
+	// life of the process. Resume with fresh batch state instead.
+	for {
+		if s.relayWorkerLoop(sendConn, rawConn) {
+			return
+		}
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+	}
+}
+
+// relayWorkerLoop is the relayWorker body. Returns true when the server is
+// shutting down, false when a panic unwound it and the caller should resume.
+func (s *Server) relayWorkerLoop(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) (shutdown bool) {
+	defer recoverHandler("relayWorker")
+
 	msgs := make([]ipv4.Message, 0, relayBatchCap)
 	payloadsToReturn := make([][]byte, 0, relayBatchCap)
 	outBufsToReturn := make([]*[]byte, 0, relayBatchCap)
@@ -983,7 +1064,7 @@ func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) {
 		select {
 		case <-s.done:
 			flush()
-			return
+			return true
 		case <-timer.C:
 			timerActive = false
 			flush()
@@ -1138,6 +1219,11 @@ func (s *Server) relayStatsLoop() {
 
 // SendPunchCommand tells a node to send UDP to a target endpoint.
 func (s *Server) SendPunchCommand(nodeID uint32, targetIP net.IP, targetPort uint16) error {
+	// See handleDiscover: reachable via the compat WSS bridge before
+	// ListenAndServe has bound the UDP sockets.
+	if s.conn == nil {
+		return fmt.Errorf("beacon: not listening")
+	}
 	// Snapshot returns the address under RLock so we don't race with
 	// a concurrent Upsert mutating beaconNode.addr — see
 	// nodes_shard.go Get() caveat (race detector flag, 2026-05-19).
@@ -1177,7 +1263,7 @@ func (s *Server) reapLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.reapStaleNodes()
+			safely("reapStaleNodes", s.reapStaleNodes)
 		case <-s.done:
 			return
 		}
@@ -1238,7 +1324,7 @@ func (s *Server) gossipLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.sendGossip()
+			safely("sendGossip", s.sendGossip)
 		case <-s.done:
 			return
 		}
@@ -1420,11 +1506,11 @@ func (s *Server) registryDiscoveryLoop() {
 	defer ticker.Stop()
 
 	// Run immediately, then on tick
-	s.registryDiscover()
+	safely("registryDiscover", s.registryDiscover)
 	for {
 		select {
 		case <-ticker.C:
-			s.registryDiscover()
+			safely("registryDiscover", s.registryDiscover)
 		case <-s.done:
 			return
 		}
