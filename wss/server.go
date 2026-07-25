@@ -419,6 +419,13 @@ func (s *Server) runAuth(ctx context.Context, conn *websocket.Conn) (uint32, err
 	if !ok {
 		return 0, fmt.Errorf("unknown node_id %d", reply.NodeID)
 	}
+	// ed25519.Verify panics on a key that is not exactly PublicKeySize
+	// bytes. PubKeyLookup is supplied by the embedding process (in
+	// production, the registry's pubkey index) so its output is not
+	// guaranteed here; reject rather than pass it through.
+	if len(pubKey) != ed25519.PublicKeySize {
+		return 0, fmt.Errorf("node_id %d has malformed public key (%d bytes)", reply.NodeID, len(pubKey))
+	}
 	sig, err := base64.StdEncoding.DecodeString(reply.Sig)
 	if err != nil {
 		return 0, fmt.Errorf("bad sig encoding: %w", err)
