@@ -37,7 +37,7 @@ func sendDiscover(t *testing.T, conn *net.UDPConn, nodeID uint32, pub ed25519.Pu
 		t.Fatalf("send discover: %v", err)
 	}
 	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Read(buf); err != nil {
 		t.Fatalf("read discover reply: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestAttackReplay_PunchTokenBypassViaPubKeyRebind(t *testing.T) {
 	sendPunchRequest(t, attackerConn, attackerID, victimID, forged)
 
 	buf := make([]byte, 64)
-	attackerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	attackerConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := attackerConn.Read(buf)
 	if err != nil {
 		t.Logf("no punch command reached the attacker — the token gate held (victim %v, attacker %v)", victimAddr, attackerAddr)

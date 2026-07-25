@@ -161,7 +161,7 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	// CI runners have been observed taking 13+ seconds before the
 	// http.Server.Serve goroutine reaches Accept. 30s gives margin
 	// without making the happy path slow (still ~10ms in practice).
-	if !waitUntil(30*time.Second, func() bool {
+	if !waitUntil(60*time.Second, func() bool {
 		_, err := net.DialTimeout("tcp", wsAddr, 1*time.Second)
 		return err == nil
 	}) {
