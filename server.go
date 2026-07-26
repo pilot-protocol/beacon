@@ -98,6 +98,19 @@ type Server struct {
 	peerMu      sync.RWMutex                            // protects s.peers only (peerNodes is atomic)
 	healthOk    atomic.Bool
 
+	// strictGossip gates the peer-set check in handleSync. Off by
+	// default so a mesh whose members reach each other from an address
+	// other than the one they advertise keeps converging; operators
+	// turn it on once every beacon's observed source address matches
+	// its registered address. See SetStrictGossip.
+	strictGossip atomic.Bool
+
+	// gossipSeen records, per gossip source address, when that source
+	// last delivered a sync. reapStaleNodes uses it to drop peerNodes
+	// entries owned by a beacon that has stopped gossiping. Guarded by
+	// peerWriteMu, alongside the peerNodes copy-on-write.
+	gossipSeen map[string]time.Time
+
 	registryAddr       string // registry address for dynamic peer discovery
 	advertiseAddr      string // address to register (overrides auto-detect from TCP local addr)
 	registryAdminToken string // admin token sent with beacon_register (required by SEC-002)
@@ -186,6 +199,7 @@ func NewWithPeers(beaconID uint32, peers []string) *Server {
 		punchRL:    newPunchRateLimiter(),
 		relayRL:    newRelayRateLimiter(),
 		discoverRL: newDiscoverRateLimiter(),
+		gossipSeen: make(map[string]time.Time),
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
@@ -269,7 +283,13 @@ func (s *Server) EnableCompatWSS(bindAddr string, pubKeyLookup bwss.PubKeyLookup
 				IP:   net.ParseIP("192.0.2.1"),
 				Port: int(senderID & 0xFFFF),
 			}
-			s.handlePacket(frame, synth)
+			// senderID here is the id the WSS bridge verified against
+			// the node's registered Ed25519 key during the connect
+			// challenge, so it is a transport-established identity and
+			// is what per-source budgets are charged against on this
+			// path (the synthetic address is shared by every bridged
+			// peer and carries no identity).
+			s.handlePacketFrom(frame, synth, senderID)
 		},
 	})
 	if err != nil {
@@ -567,7 +587,16 @@ func (s *Server) RelayDropped() uint64 { return s.relayDropped.Load() }
 // node was not registered with the beacon.
 func (s *Server) RelayNotFound() uint64 { return s.relayNotFound.Load() }
 
+// handlePacket dispatches an inbound UDP datagram.
 func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
+	s.handlePacketFrom(data, remote, 0)
+}
+
+// handlePacketFrom dispatches an inbound frame. bridgePeer is the peer
+// id the compat WSS bridge authenticated at connect time, or 0 when the
+// frame arrived as a UDP datagram; it selects which transport-level
+// identifier the relay budget is charged against.
+func (s *Server) handlePacketFrom(data []byte, remote *net.UDPAddr, bridgePeer uint32) {
 	// Outermost defer: a panic anywhere in the dispatch below drops this
 	// one datagram and leaves the read loop running. Every inbound packet
 	// on this path is unauthenticated remote input.
@@ -590,7 +619,11 @@ func (s *Server) handlePacket(data []byte, remote *net.UDPAddr) {
 	case protocol.BeaconMsgPunchRequest:
 		s.handlePunchRequest(data[1:], remote)
 	case protocol.BeaconMsgRelay:
-		s.dispatchRelay(data[1:])
+		if bridgePeer != 0 {
+			s.dispatchRelay(data[1:], relaySourceForBridge(bridgePeer))
+		} else {
+			s.dispatchRelay(data[1:], relaySourceForUDP(remote))
+		}
 	case protocol.BeaconMsgSync:
 		s.handleSync(data[1:], remote)
 	default:
@@ -798,7 +831,11 @@ rateLimitBypass:
 // dispatchRelay parses the relay header and dispatches to a worker goroutine.
 // The read loop stays fast — no locks (other than a sharded RLock for the
 // pre-check), no syscalls, no allocations on the hot path.
-func (s *Server) dispatchRelay(data []byte) {
+//
+// src is the transport-level origin of the frame, supplied by the caller.
+// The sender id carried inside the frame is routing metadata echoed back to
+// the destination and is not used for accounting.
+func (s *Server) dispatchRelay(data []byte, src relaySourceKey) {
 	if len(data) < 8 {
 		return
 	}
@@ -861,15 +898,21 @@ func (s *Server) dispatchRelay(data []byte) {
 	}
 
 	// Per-source rate limit: prevent one sender from flooding the relay
-	// queue and squeezing out legitimate traffic. A DoS source targeting
-	// a known destination can saturate the 524288-deep relayCh at rates
+	// queue and squeezing out legitimate traffic. A source targeting a
+	// known destination can saturate the 524288-deep relayCh at rates
 	// far above normal — this cap gives each source a fixed share.
+	//
+	// The budget is keyed on src (the observed datagram endpoint, or the
+	// bridge-authenticated peer id for WSS-delivered frames) rather than
+	// on senderID: senderID is a field of the frame body, so keying on it
+	// would let one origin open an unbounded number of independent
+	// budgets by varying that field between packets.
 	now := time.Now().UnixNano()
 	// Source exceeded per-second budget — silently drop. The sender's
 	// daemon retries (3-attempt path in pkg/daemon/daemon.go relay
 	// branch), so a drop here is eventually self-healing for honest
 	// senders.
-	if !s.relayRL.allow(senderID, now, maxRelaysPerSourcePerSecond) {
+	if !s.relayRL.allow(src, now, maxRelaysPerSourcePerSecond) {
 		return
 	}
 
@@ -1258,6 +1301,9 @@ func (s *Server) reapStaleNodes() {
 	s.relayRL.sweep(time.Now().Add(-relaySourceCleanupInterval).UnixNano())
 	s.discoverRL.sweep(time.Now().Add(-discoverMinInterval * 2))
 
+	// Withdraw routes published by beacons that stopped gossiping.
+	s.sweepStaleGossip(time.Now().Add(-gossipPeerTTL))
+
 	s.nodePubKeys.Range(func(k, _ interface{}) bool {
 		id, ok := k.(uint32)
 		if ok && !s.nodes.Has(id) {
@@ -1316,10 +1362,93 @@ func (s *Server) sendGossip() {
 	slog.Debug("gossip sent", "beacon_id", s.beaconID, "nodes", len(nodeIDs), "peers", len(peers))
 }
 
+// SetStrictGossip controls whether inbound gossip sync messages must
+// come from an address in the peer set — the beacons configured at
+// construction plus those learned from the registry in
+// registryDiscover. With it off (the default) any source may publish
+// node-id → beacon routes into the peer mesh, so it should be enabled
+// wherever every mesh member's observed source address matches the
+// address it registers. Off by default because a beacon behind DNAT
+// egresses from an address other than the one it advertises, and
+// enabling the check there would stop the mesh from converging.
+func (s *Server) SetStrictGossip(v bool) {
+	s.strictGossip.Store(v)
+}
+
+// StrictGossip reports whether the handleSync peer-set check is active.
+func (s *Server) StrictGossip() bool {
+	return s.strictGossip.Load()
+}
+
+// isKnownGossipPeer reports whether remote's address belongs to a beacon
+// in the peer set. Only the address is compared, not the port: peers are
+// recorded by their advertised listen endpoint, and gossip egresses from
+// that same socket, but a middlebox in the path may rewrite the port.
+func (s *Server) isKnownGossipPeer(remote *net.UDPAddr) bool {
+	if remote == nil {
+		return false
+	}
+	s.peerMu.RLock()
+	defer s.peerMu.RUnlock()
+	for _, p := range s.peers {
+		if p != nil && p.IP.Equal(remote.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+// gossipPeerTTL is how long a peerNodes entry survives without its
+// owning beacon delivering another sync. gossipLoop ticks every 10s, so
+// this tolerates several consecutive losses before the routes a silent
+// beacon published are withdrawn.
+const gossipPeerTTL = 90 * time.Second
+
+// sweepStaleGossip drops peerNodes entries owned by a gossip source that
+// has not delivered a sync since cutoff, so routes to a beacon that went
+// away stop being handed to the relay workers.
+func (s *Server) sweepStaleGossip(cutoff time.Time) {
+	s.peerWriteMu.Lock()
+	defer s.peerWriteMu.Unlock()
+
+	stale := make(map[string]struct{})
+	for key, last := range s.gossipSeen {
+		if last.Before(cutoff) {
+			stale[key] = struct{}{}
+			delete(s.gossipSeen, key)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+
+	cur := *s.peerNodes.Load()
+	next := make(map[uint32]*net.UDPAddr, len(cur))
+	for id, addr := range cur {
+		if _, drop := stale[addr.String()]; drop {
+			continue
+		}
+		next[id] = addr
+	}
+	if len(next) == len(cur) {
+		return
+	}
+	s.peerNodes.Store(&next)
+	slog.Debug("gossip peers expired", "sources", len(stale), "routes_dropped", len(cur)-len(next))
+}
+
 // handleSync processes an incoming gossip sync message from a peer beacon.
 func (s *Server) handleSync(data []byte, remote *net.UDPAddr) {
 	// Need at least beaconID(4) + nodeCount(2)
 	if len(data) < 6 {
+		return
+	}
+
+	// Peer-set gate (opt-in, see SetStrictGossip). A sync rewrites the
+	// node-id → beacon routing table the relay workers read, so when the
+	// gate is on only members of the known peer set may publish into it.
+	if s.strictGossip.Load() && !s.isKnownGossipPeer(remote) {
+		slog.Debug("gossip sync from address outside the peer set", "from", remote)
 		return
 	}
 
@@ -1356,6 +1485,10 @@ func (s *Server) handleSync(data []byte, remote *net.UDPAddr) {
 		}
 	}
 	s.peerNodes.Store(&next)
+	if s.gossipSeen == nil {
+		s.gossipSeen = make(map[string]time.Time)
+	}
+	s.gossipSeen[remote.String()] = time.Now()
 	s.peerWriteMu.Unlock()
 
 	slog.Debug("gossip sync received", "peer_beacon_id", peerBeaconID, "nodes", nodeCount, "from", remote)
