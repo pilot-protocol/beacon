@@ -225,7 +225,7 @@ func FuzzBeaconDispatchRelay(f *testing.F) {
 		if len(data) > maxRelayPayload {
 			data = data[:maxRelayPayload]
 		}
-		s.dispatchRelay(data)
+		s.dispatchRelay(data, relaySourceForUDP(fuzzAddr))
 		// Drain so the buffered channel cannot fill across iterations.
 		for {
 			select {

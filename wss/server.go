@@ -61,6 +61,14 @@ const DefaultAuthTimeout = 10 * time.Second
 // the outer ceiling.
 const DefaultIdleTimeout = 90 * time.Second
 
+// DefaultWriteTimeout bounds a single outbound frame write. It is
+// deliberately much shorter than DefaultIdleTimeout: WriteFrame is
+// called from the beacon's relay workers, so the deadline is the
+// longest a worker can sit inside one write before the peer is
+// dropped and the worker is handed back. Idle-connection lifetime is
+// a separate concern and keeps using IdleTimeout.
+const DefaultWriteTimeout = 2 * time.Second
+
 // Config configures a Server.
 type Config struct {
 	// BindAddr is the host:port to listen on. Typically
@@ -83,6 +91,11 @@ type Config struct {
 
 	// IdleTimeout overrides DefaultIdleTimeout.
 	IdleTimeout time.Duration
+
+	// WriteTimeout overrides DefaultWriteTimeout. It caps how long a
+	// single WriteFrame call may block on a peer whose socket is not
+	// draining; on expiry the write fails and the peer is dropped.
+	WriteTimeout time.Duration
 
 	// MaxPeers caps the number of concurrent WSS peer connections.
 	// New upgrades beyond this are rejected with 503. 0 = unlimited.
@@ -177,6 +190,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = DefaultIdleTimeout
 	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = DefaultWriteTimeout
+	}
 	return &Server{
 		cfg:   cfg,
 		peers: make(map[uint32]*wssPeer),
@@ -253,6 +269,11 @@ func (s *Server) Close() error {
 // given node ID. Returns false if destID is not currently connected
 // — the caller (relay router) should fall back to UDP. Returns false
 // + logs on write error (peer is then dropped).
+//
+// The write is bounded by Config.WriteTimeout so a peer that stops
+// draining its socket cannot pin the calling goroutine for the whole
+// idle window. On expiry the peer is dropped, which makes subsequent
+// calls for the same node ID return immediately.
 func (s *Server) WriteFrame(destID uint32, frame []byte) bool {
 	s.mu.RLock()
 	p := s.peers[destID]
@@ -261,12 +282,12 @@ func (s *Server) WriteFrame(destID uint32, frame []byte) bool {
 		return false
 	}
 	p.writeMu.Lock()
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.IdleTimeout)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.WriteTimeout)
 	err := p.conn.Write(ctx, websocket.MessageBinary, frame)
+	cancel()
 	p.writeMu.Unlock()
 	if err != nil {
-		s.dropPeer(destID, "write error: "+err.Error())
+		s.dropPeer(p, "write error: "+err.Error())
 		return false
 	}
 	s.framesOut.Add(1)
@@ -453,7 +474,7 @@ func (s *Server) runAuth(ctx context.Context, conn *websocket.Conn) (uint32, err
 // peerReadLoop drains binary frames from a peer's WS connection into
 // the OnFrame callback. Exits on Close, read error, or idle timeout.
 func (s *Server) peerReadLoop(p *wssPeer) {
-	defer s.dropPeer(p.nodeID, "read loop exit")
+	defer s.dropPeer(p, "read loop exit")
 
 	for {
 		if p.closed.Load() {
@@ -504,18 +525,26 @@ func (s *Server) peerGenForNode(nodeID uint32) uint32 {
 	return p.gen.Load()
 }
 
-// dropPeer removes a peer from the map and closes the underlying WS
-// connection. Idempotent — safe to call from both the read loop exit
-// and an explicit Close path.
-func (s *Server) dropPeer(nodeID uint32, reason string) {
+// dropPeer closes p's underlying WS connection and removes it from the
+// peer map, but only if p is still the connection installed for its
+// node ID. A node that reconnects installs a fresh *wssPeer under the
+// same key while the previous connection's read loop is still
+// unwinding; the compare-and-delete keeps that unwinding loop from
+// deregistering the live connection it was replaced by.
+//
+// Idempotent — safe to call from both the read loop exit and an
+// explicit Close path.
+func (s *Server) dropPeer(p *wssPeer, reason string) {
+	if p == nil {
+		return
+	}
 	s.mu.Lock()
-	p := s.peers[nodeID]
-	if p != nil {
-		delete(s.peers, nodeID)
+	if s.peers[p.nodeID] == p {
+		delete(s.peers, p.nodeID)
 	}
 	s.mu.Unlock()
-	if p != nil && !p.closed.Swap(true) {
+	if !p.closed.Swap(true) {
 		_ = p.conn.Close(websocket.StatusNormalClosure, reason)
-		slog.Info("wss peer disconnected", "node_id", nodeID, "reason", reason)
+		slog.Info("wss peer disconnected", "node_id", p.nodeID, "reason", reason)
 	}
 }

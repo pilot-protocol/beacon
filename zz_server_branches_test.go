@@ -97,7 +97,7 @@ func TestDispatchRelay_OversizePayloadDropped(t *testing.T) {
 	data := make([]byte, 8+maxRelayPayload+1)
 	binary.BigEndian.PutUint32(data[0:4], 1)
 	binary.BigEndian.PutUint32(data[4:8], 11)
-	s.dispatchRelay(data)
+	s.dispatchRelay(data, relaySourceForUDP(addr))
 	// No assertion — we just want the branch hit (and no panic).
 }
 
@@ -107,7 +107,7 @@ func TestDispatchRelay_TooShortNoOp(t *testing.T) {
 	t.Parallel()
 	s := New()
 	defer s.Close()
-	s.dispatchRelay([]byte{0x01, 0x02}) // < 8
+	s.dispatchRelay([]byte{0x01, 0x02}, relaySourceKey{}) // < 8
 }
 
 // TestDispatchRelay_DestInPeerMesh covers the peerMap-hit branch in
@@ -129,7 +129,7 @@ func TestDispatchRelay_DestInPeerMesh(t *testing.T) {
 	binary.BigEndian.PutUint32(data[0:4], 1)
 	binary.BigEndian.PutUint32(data[4:8], 42)
 	data[8], data[9], data[10], data[11] = 'X', 'Y', 'Z', '!'
-	s.dispatchRelay(data)
+	s.dispatchRelay(data, relaySourceForUDP(peer))
 }
 
 // TestRelayStatsLoop_ClosesOnDone exercises the s.done branch of
