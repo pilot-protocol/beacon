@@ -1311,6 +1311,24 @@ func (s *Server) reapStaleNodes() {
 		}
 		return true
 	})
+
+	// dstNodes had no Delete anywhere: entries were Stored in the discover
+	// handler and only ever Loaded on the relay path. The node id comes
+	// straight off the wire (data[0:4]) in an unauthenticated datagram, so
+	// the key space is the full uint32 range and an attacker chose it
+	// freely — steady, unbounded growth on a process that is embedded in
+	// the production registry.
+	//
+	// Same treatment as nodePubKeys directly above: an entry is only
+	// meaningful while the node is still known, so drop it once the node
+	// has aged out of s.nodes.
+	s.dstNodes.Range(func(k, _ interface{}) bool {
+		id, ok := k.(uint32)
+		if ok && !s.nodes.Has(id) {
+			s.dstNodes.Delete(k)
+		}
+		return true
+	})
 }
 
 // --- Gossip ---
