@@ -49,14 +49,37 @@ func TestRelayBudgetIsPerDatagramSource(t *testing.T) {
 	// Three times the per-source budget, every packet claiming a
 	// different sender id.
 	const attempts = maxRelaysPerSourcePerSecond * 3
+	start := time.Now()
 	for i := 0; i < attempts; i++ {
 		s.dispatchRelay(relayFrame(uint32(i+1), dest, "x"), relaySourceForUDP(src))
 	}
+	elapsed := time.Since(start)
 
 	got := drainRelayCh(s)
-	if got > maxRelaysPerSourcePerSecond {
-		t.Fatalf("one datagram source enqueued %d relays with rotating sender ids; budget is %d per second",
-			got, maxRelaysPerSourcePerSecond)
+
+	// The budget is a 1-second window (allow() rolls the window when
+	// nowNano-windowStart >= 1s), so the ceiling has to account for how
+	// long the loop actually took. dispatchRelay reads the real clock —
+	// allow() takes nowNano but the caller supplies time.Now() — so a
+	// loaded CI runner that spends 2.3s in this loop legitimately opens
+	// three windows and passes ~3x the per-window budget.
+	//
+	// Asserting a flat budget assumed the whole burst fit inside one
+	// window. That held on a fast dev box (~0.25s) and failed on CI,
+	// where this test has been red on main since it landed. The property
+	// under test is that rotating the SENDER ID does not multiply the
+	// budget — not how fast the machine is.
+	windows := int(elapsed/time.Second) + 1
+	ceiling := maxRelaysPerSourcePerSecond * windows
+	if got > ceiling {
+		t.Fatalf("one datagram source enqueued %d relays with rotating sender ids in %v; "+
+			"budget is %d per second and at most %d window(s) elapsed (ceiling %d)",
+			got, elapsed, maxRelaysPerSourcePerSecond, windows, ceiling)
+	}
+	// Independently of timing, the limiter must actually limit: without
+	// per-source keying every one of the attempts would be enqueued.
+	if got >= attempts {
+		t.Fatalf("all %d relays enqueued — rotating the sender id bypassed the per-source budget entirely", got)
 	}
 	if got == 0 {
 		t.Fatalf("no relays enqueued at all; the limiter rejected everything")
