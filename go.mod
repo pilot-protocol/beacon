@@ -5,7 +5,7 @@ go 1.25.12
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/pilot-protocol/common v0.5.13
-	golang.org/x/net v0.57.0
+	golang.org/x/net v0.58.0
 )
 
 require golang.org/x/sys v0.47.0 // indirect
