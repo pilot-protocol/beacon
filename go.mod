@@ -1,10 +1,10 @@
 module github.com/pilot-protocol/beacon
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/pilot-protocol/common v0.5.13
+	github.com/pilot-protocol/common v0.5.14
 	golang.org/x/net v0.58.0
 )
 
