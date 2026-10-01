@@ -28,6 +28,8 @@ import (
 type beaconNode struct {
 	addr     *net.UDPAddr
 	lastSeen time.Time
+	// lastNotify is when NotifyNode last sent this node a MsgNotify.
+	lastNotify time.Time
 }
 
 // relayJob is a pre-parsed relay packet dispatched to a worker.
@@ -1320,6 +1322,44 @@ func (s *Server) SendPunchCommand(nodeID uint32, targetIP net.IP, targetPort uin
 	binary.BigEndian.PutUint16(msg[2+len(ip):], targetPort)
 
 	_, err := s.conn.WriteToUDP(msg, nodeAddr)
+	return err
+}
+
+// MsgNotify is a beacon → node message, [0x0A][kind(1)], telling the node
+// that the registry is holding something for it. It carries no node ID,
+// address or payload, so it discloses nothing to the node or to anyone
+// watching the path; the node reacts by polling the registry over its own
+// authenticated connection. Daemons that predate it drop it as an unknown
+// beacon message. (The other beacon message types live in common/protocol;
+// this one should move there. Must match the daemon's beaconMsgNotify.)
+const MsgNotify byte = 0x0A
+
+// NotifyKindHandshake is the MsgNotify kind for a relayed trust-handshake
+// request or answer waiting at the registry.
+const NotifyKindHandshake byte = 0x01
+
+// notifyMinInterval is the least time between two notifies to one node.
+// A notify only asks the node to poll, and a poll collects everything that
+// is waiting, so more often than this buys nothing.
+const notifyMinInterval = time.Second
+
+// NotifyNode tells a node that the registry holds a relayed handshake for
+// it. Best effort: the node may not be registered with this beacon, may be
+// on the compat (WSS) transport, or may predate MsgNotify — it then finds
+// the handshake on its next poll, as before. A notify within
+// notifyMinInterval of the previous one to the same node is skipped (nil).
+func (s *Server) NotifyNode(nodeID uint32) error {
+	if s.conn == nil {
+		return fmt.Errorf("beacon: not listening")
+	}
+	nodeAddr, ok, throttled := s.nodes.claimNotify(nodeID, time.Now(), notifyMinInterval)
+	if !ok {
+		return fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
+	}
+	if throttled {
+		return nil
+	}
+	_, err := s.conn.WriteToUDP([]byte{MsgNotify, NotifyKindHandshake}, nodeAddr)
 	return err
 }
 
