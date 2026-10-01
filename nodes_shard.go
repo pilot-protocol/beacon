@@ -91,6 +91,23 @@ func (m *nodeMap) Snapshot(nodeID uint32) (addr *net.UDPAddr, ok bool) {
 	return n.addr, true
 }
 
+// claimNotify returns the node's address for a notify and records the
+// time, unless one was sent to it within minGap (throttled).
+func (m *nodeMap) claimNotify(nodeID uint32, now time.Time, minGap time.Duration) (addr *net.UDPAddr, ok, throttled bool) {
+	s := m.shardFor(nodeID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, exists := s.nodes[nodeID]
+	if !exists {
+		return nil, false, false
+	}
+	if !n.lastNotify.IsZero() && now.Sub(n.lastNotify) < minGap {
+		return n.addr, true, true
+	}
+	n.lastNotify = now
+	return n.addr, true, false
+}
+
 // Has reports whether the node is locally registered.
 func (m *nodeMap) Has(nodeID uint32) bool {
 	s := m.shardFor(nodeID)
