@@ -226,16 +226,8 @@ func FuzzBeaconDispatchRelay(f *testing.F) {
 			data = data[:maxRelayPayload]
 		}
 		s.dispatchRelay(data, relaySourceForUDP(fuzzAddr))
-		// Drain so the buffered channel cannot fill across iterations.
-		for {
-			select {
-			case job := <-s.relayCh:
-				s.returnPayload(job.payload)
-				continue
-			default:
-			}
-			break
-		}
+		// Drain so the buffered shards cannot fill across iterations.
+		drainRelayCh(s)
 	})
 }
 

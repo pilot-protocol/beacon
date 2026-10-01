@@ -46,9 +46,9 @@ type Server struct {
 	nodes          *nodeMap           // sharded node_id → observed endpoint + last-seen
 	dstNodes       sync.Map           // node_id → struct{}: endpoints that requested dest-carrying delivery (0x09)
 	readyCh        chan struct{}
-	relayCh        chan relayJob // buffered channel for relay workers
-	pool           sync.Pool     // reusable payload buffers (inner relay payload)
-	outBufPool     sync.Pool     // reusable outbound packet buffers (header + payload)
+	relayChs       []chan relayJob // per-worker sharded relay queues
+	pool           sync.Pool       // reusable payload buffers (inner relay payload)
+	outBufPool     sync.Pool       // reusable outbound packet buffers (header + payload)
 
 	// Relay counters (atomic for lock-free worker access)
 	relayForwarded  atomic.Uint64 // successful relay deliveries
@@ -143,6 +143,16 @@ type Server struct {
 // destID(4) + a pooled []byte payload), so worst-case bump is ~50MB.
 const relayQueueSize = 524288
 
+// relayWorkerCount is the relay-worker (and sharded-queue) count. Kept in one
+// place so New sizes the queues exactly as ListenAndServe spawns workers.
+func relayWorkerCount() int {
+	n := runtime.NumCPU()
+	if n < 8 {
+		n = 8
+	}
+	return n
+}
+
 // maxRelayPayload caps the relay payload size. UDP itself limits datagrams to ~65KB,
 // but this provides defense-in-depth against future transport changes.
 const maxRelayPayload = 65535
@@ -162,10 +172,10 @@ const beaconNodeTTL = 10 * time.Minute
 // trigger the beacon to send packets to arbitrary targets, and timing
 // side-channels leak node registration status.
 const (
-	maxPunchPerSecond       = 10              // global hard cap on punch commands per second
-	punchPerSourceInterval  = time.Second     // min interval between punches from same source
-	punchRateCleanupInterval = 5 * time.Minute // how often stale source entries are swept
-	discoverMinInterval     = 30 * time.Second // min interval between endpoint updates from same nodeID
+	maxPunchPerSecond        = 10               // global hard cap on punch commands per second
+	punchPerSourceInterval   = time.Second      // min interval between punches from same source
+	punchRateCleanupInterval = 5 * time.Minute  // how often stale source entries are swept
+	discoverMinInterval      = 30 * time.Second // min interval between endpoint updates from same nodeID
 )
 
 // relaySourceWindow tracks a single source's relay count in the current 1-second window.
@@ -192,15 +202,30 @@ func New() *Server {
 // peers is a list of peer beacon addresses for gossip exchange.
 func NewWithPeers(beaconID uint32, peers []string) *Server {
 	s := &Server{
-		nodes:    newNodeMap(),
-		readyCh:  make(chan struct{}),
-		relayCh:  make(chan relayJob, relayQueueSize),
-		beaconID: beaconID,
-		done:     make(chan struct{}),
+		nodes:      newNodeMap(),
+		readyCh:    make(chan struct{}),
+		beaconID:   beaconID,
+		done:       make(chan struct{}),
 		punchRL:    newPunchRateLimiter(),
 		relayRL:    newRelayRateLimiter(),
 		discoverRL: newDiscoverRateLimiter(),
 		gossipSeen: make(map[string]time.Time),
+	}
+	// Shard the relay queue per worker. A single shared channel serialised
+	// every send/recv on one hchan lock (mutex profile: relayCh send/recv were
+	// the top two contention sites at ~300k relays/sec). With one channel per
+	// worker and destID-keyed dispatch, senders spread across N hchan locks
+	// and each worker has a private receive queue (and per-dest ordering).
+	{
+		n := relayWorkerCount()
+		per := relayQueueSize / n
+		if per < 1 {
+			per = 1
+		}
+		s.relayChs = make([]chan relayJob, n)
+		for i := range s.relayChs {
+			s.relayChs[i] = make(chan relayJob, per)
+		}
 	}
 	emptyPeers := make(map[uint32]*net.UDPAddr)
 	s.peerNodes.Store(&emptyPeers)
@@ -440,13 +465,9 @@ func (s *Server) ListenAndServe(addr string) error {
 	//      drain capacity, ~4× fewer sendmmsg syscalls.
 	// Each worker is one goroutine + a 32-slot ipv4.Message buffer + a
 	// 32-slot payload-return slice (~6 KB).
-	workers := runtime.NumCPU()
-	if workers < 8 {
-		workers = 8
-	}
-	for i := 0; i < workers; i++ {
+	for i := 0; i < len(s.relayChs); i++ {
 		idx := i % len(s.sendBatchConns)
-		go s.relayWorker(s.sendBatchConns[idx], s.sendRawConns[idx])
+		go s.relayWorker(s.sendBatchConns[idx], s.sendRawConns[idx], s.relayChs[i])
 	}
 
 	// Start relay stats logger (every 60s)
@@ -941,8 +962,9 @@ func (s *Server) dispatchRelay(data []byte, src relaySourceKey) {
 	}
 	copy(buf, payload)
 
+	ch := s.relayChs[destID%uint32(len(s.relayChs))]
 	select {
-	case s.relayCh <- relayJob{senderID: senderID, destID: destID, payload: buf}:
+	case ch <- relayJob{senderID: senderID, destID: destID, payload: buf}:
 	default:
 		// Queue full — drop packet (UDP is best-effort). Rare now that
 		// the pre-check filters not-found at the read loop, but still
@@ -990,12 +1012,12 @@ const relayFlushAfter = 2 * time.Millisecond
 // WriteBatch globally — the send-side bottleneck before fan-out.
 // With per-fd workers, sends parallelise across fds and the only
 // serialisation left is per-worker (its own batch state).
-func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) {
+func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn, ch chan relayJob) {
 	// A panic while shaping one relay job must not permanently retire this
 	// worker — that would cut the beacon's drain capacity by 1/N for the
 	// life of the process. Resume with fresh batch state instead.
 	for {
-		if s.relayWorkerLoop(sendConn, rawConn) {
+		if s.relayWorkerLoop(sendConn, rawConn, ch) {
 			return
 		}
 		select {
@@ -1008,7 +1030,7 @@ func (s *Server) relayWorker(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) {
 
 // relayWorkerLoop is the relayWorker body. Returns true when the server is
 // shutting down, false when a panic unwound it and the caller should resume.
-func (s *Server) relayWorkerLoop(sendConn *ipv4.PacketConn, rawConn *net.UDPConn) (shutdown bool) {
+func (s *Server) relayWorkerLoop(sendConn *ipv4.PacketConn, rawConn *net.UDPConn, ch chan relayJob) (shutdown bool) {
 	defer recoverHandler("relayWorker")
 
 	msgs := make([]ipv4.Message, 0, relayBatchCap)
@@ -1102,7 +1124,7 @@ func (s *Server) relayWorkerLoop(sendConn *ipv4.PacketConn, rawConn *net.UDPConn
 			timerActive = false
 			flush()
 			continue
-		case job := <-s.relayCh:
+		case job := <-ch:
 			// Tier 0: compat-mode WSS destination. Bypass the
 			// sendmmsg batching path entirely — WSS writes go to a
 			// per-conn TCP stream, no batching benefit. The WSS
