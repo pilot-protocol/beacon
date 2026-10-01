@@ -4,7 +4,7 @@ go 1.25.13
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/pilot-protocol/common v0.5.14
+	github.com/pilot-protocol/common v0.6.0
 	golang.org/x/net v0.58.0
 )
 

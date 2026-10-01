@@ -21,15 +21,19 @@ func relayFrame(senderID, destID uint32, payload string) []byte {
 
 func drainRelayCh(s *Server) int {
 	n := 0
-	for {
-		select {
-		case job := <-s.relayCh:
-			s.returnPayload(job.payload)
-			n++
-		default:
-			return n
+	for _, ch := range s.relayChs {
+		for {
+			select {
+			case job := <-ch:
+				s.returnPayload(job.payload)
+				n++
+				continue
+			default:
+			}
+			break
 		}
 	}
+	return n
 }
 
 // TestRelayBudgetIsPerDatagramSource pins that the relay budget is
