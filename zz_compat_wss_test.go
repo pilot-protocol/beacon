@@ -15,8 +15,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/crypto"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // authChallengeMsg / authReplyMsg / authOKMsg mirror the unexported
@@ -120,8 +120,6 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 	nodeID := uint32(4242)
 
 	s := New()
-	go s.ListenAndServe("127.0.0.1:0")
-	<-s.Ready()
 	defer s.Close()
 
 	lookup := func(qid uint32) (ed25519.PublicKey, bool) {
@@ -131,9 +129,16 @@ func TestEnableCompatWSS_HappyPath(t *testing.T) {
 		return nil, false
 	}
 
+	// Before ListenAndServe, as EnableCompatWSS documents: the read loop
+	// reads the WSS server it installs on every relayed packet. Enabling it
+	// after the loop had started was a data race, which the race detector
+	// reported intermittently in CI against this test and whichever tests
+	// were running beside it.
 	if err := s.EnableCompatWSS("127.0.0.1:0", lookup); err != nil {
 		t.Fatalf("EnableCompatWSS: %v", err)
 	}
+	go s.ListenAndServe("127.0.0.1:0")
+	<-s.Ready()
 
 	wsAddr := s.WSSAddr()
 	if wsAddr == "" {

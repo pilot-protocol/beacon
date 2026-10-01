@@ -153,6 +153,13 @@ func relayWorkerCount() int {
 	return n
 }
 
+// relayQueueFor returns the relay queue (and with it the worker) that carries
+// a packet for destID. Every packet to one destination takes the same queue,
+// so the packets of a flow leave the beacon in the order they arrived.
+func (s *Server) relayQueueFor(destID uint32) chan relayJob {
+	return s.relayChs[destID%uint32(len(s.relayChs))]
+}
+
 // maxRelayPayload caps the relay payload size. UDP itself limits datagrams to ~65KB,
 // but this provides defense-in-depth against future transport changes.
 const maxRelayPayload = 65535
@@ -185,12 +192,18 @@ type relaySourceWindow struct {
 }
 
 // maxRelaysPerSourcePerSecond caps relays a single sender can push through
-// dispatchRelay per second. Set generously (1000 relays/sec) — a legitimate
-// source behind NAT may relay traffic for many agents, but a DoS source
-// flooding relays to a known target can saturate the 524288-deep relayCh
-// and cause queue-full drops for everyone. This cap prevents one source
-// from consuming more than ~0.2% of total queue capacity per second.
-const maxRelaysPerSourcePerSecond = 1000
+// dispatchRelay per second — a legitimate source behind NAT may relay
+// traffic for many agents, but a DoS source flooding relays to a known
+// target can fill a relay queue and cause queue-full drops for the flows
+// that share it.
+//
+// The cap counts packets, so what it allows in bytes depends on the size of
+// the sender's datagrams. Daemons used to send stream segments as ~4.2 KB
+// datagrams (fragmented by IP), and 1000 a second was about 4 MB/s. They now
+// send ~1.2 KB datagrams that fit one packet; 4000 a second keeps the same
+// ceiling in bytes. At 1000 a relayed transfer was held to about 1.1 MB/s,
+// with everything past the cap dropped and retransmitted.
+const maxRelaysPerSourcePerSecond = 4000
 const relaySourceCleanupInterval = 5 * time.Minute
 
 func New() *Server {
@@ -962,7 +975,7 @@ func (s *Server) dispatchRelay(data []byte, src relaySourceKey) {
 	}
 	copy(buf, payload)
 
-	ch := s.relayChs[destID%uint32(len(s.relayChs))]
+	ch := s.relayQueueFor(destID)
 	select {
 	case ch <- relayJob{senderID: senderID, destID: destID, payload: buf}:
 	default:
@@ -1075,12 +1088,16 @@ func (s *Server) relayWorkerLoop(sendConn *ipv4.PacketConn, rawConn *net.UDPConn
 		} else {
 			var err error
 			n, err = sendConn.WriteBatch(msgs, 0)
-			if err != nil {
-				// Unexpected on an IPv4-bound socket, but fall back to
-				// per-packet for the messages the batch didn't send rather
-				// than dropping them.
-				slog.Debug("relay write batch failed, falling back to per-packet send",
-					"n", n, "of", len(msgs), "err", err)
+			if n < len(msgs) {
+				// The batch call sent only part of the batch: an error
+				// (unexpected on an IPv4-bound socket), a short sendmmsg,
+				// or a platform without sendmmsg, where WriteBatch sends
+				// one message per call and reports no error. Send the
+				// rest per-packet rather than dropping them.
+				if err != nil {
+					slog.Debug("relay write batch failed, falling back to per-packet send",
+						"n", n, "of", len(msgs), "err", err)
+				}
 				for i := n; i < len(msgs); i++ {
 					dst, ok := msgs[i].Addr.(*net.UDPAddr)
 					if !ok {
