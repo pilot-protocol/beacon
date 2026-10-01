@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -520,8 +521,18 @@ func (s *Server) readLoopBatches(conn *net.UDPConn) (err error, done bool) {
 	for {
 		n, rerr := pc.ReadBatch(msgs, 0)
 		if rerr != nil {
-			if opErr, ok := rerr.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+			// A closed socket, or a server being closed, ends the loop. On
+			// the Linux recvmmsg path the error is wrapped twice ("read udp
+			// ...: raw-read udp4 ...: use of closed network connection"),
+			// so comparing the inner error's text never matched there and
+			// every reader spun on its closed socket after Close.
+			if errors.Is(rerr, net.ErrClosed) {
 				return nil, true
+			}
+			select {
+			case <-s.done:
+				return nil, true
+			default:
 			}
 			slog.Debug("beacon read batch error", "err", rerr)
 			continue
